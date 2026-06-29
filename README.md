@@ -39,3 +39,20 @@ python realsense_yolo.py
 | `realsense_yolo.py` | RealSense + YOLO 姿态 + 骨长约束 |
 | `joint_angles.py` | 关节角计算与正运动学可视化 |
 | `yolo11n-pose.pt` | YOLO 预训练权重 |
+
+## 发布到 GitHub
+
+本地已配置远程 `https://github.com/CielErrance/ski-cv.git`。首次推送：
+
+```powershell
+gh auth login
+.\publish.ps1
+```
+
+若 `github.com` HTTPS 超时，可开代理后重试，或将 `~/.ssh/id_rsa.pub` 添加到 GitHub SSH keys 后：
+
+```powershell
+$env:GIT_SSH_COMMAND = 'ssh -p 443 -o Hostname=ssh.github.com'
+git remote set-url origin git@github.com:CielErrance/ski-cv.git
+git push -u origin main
+```
