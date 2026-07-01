@@ -1,3 +1,10 @@
+import multiprocessing as mp_ctx
+import os
+
+# 采集子进程不初始化 TkAgg，避免与主进程 OpenCV/matplotlib GUI 争用 GIL
+if mp_ctx.current_process().name != "MainProcess":
+    os.environ.setdefault("MPLBACKEND", "Agg")
+
 import cv2
 import numpy as np
 import pyrealsense2 as rs
@@ -15,25 +22,24 @@ from mediapipe.tasks.python.vision.pose_landmarker import (
 )
 # import json
 # import struct
+import json
 import time
 import math
-import multiprocessing as mp_ctx
 from queue import Empty, Full
-# import socket
-import os
 import shutil
 from pathlib import Path
-from typing import Optional
+from datetime import datetime
+from typing import Optional, TextIO
 from urllib.request import urlretrieve
 
 from joint_angles import (
     ForwardKinematics,
     JointAngleCalculator,
     ReconstructedPoseVisualizer,
+    _plt,
     figure_is_alive,
     pump_matplotlib_events,
 )
-import matplotlib.pyplot as plt
 
 POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
@@ -74,6 +80,9 @@ ONE_EURO_MIN_CUTOFF = 2.0
 ONE_EURO_BETA = 0.02
 ONE_EURO_D_CUTOFF = 1.0
 KEYPOINT_CONF_THRESHOLD = 0.0
+
+CV_WINDOW_NAME = "Motion Capture (Local Debug)"
+RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
 
 # # TCP 客户端连接配置
 # CLIENT_TCP_HOST = "0.0.0.0"
@@ -268,6 +277,7 @@ class Pose3DVisualizer:
     """
 
     def __init__(self, connections) -> None:
+        plt = _plt()
         plt.ion()
         self._closed = False
         self.connections = connections
@@ -340,8 +350,73 @@ class Pose3DVisualizer:
         self.fig.canvas.draw_idle()
 
     def close(self) -> None:
+        plt = _plt()
         plt.ioff()
         plt.close(self.fig)
+
+
+def build_broadcast_payload(packet: dict) -> dict:
+    """与 TCP 广播/录制一致：Time + 各关节角平铺为独立字段。"""
+    payload: dict = {"Time": packet["timestamp"]}
+    payload.update(packet.get("joint_angles", {}))
+    return payload
+
+
+class BroadcastRecorder:
+    """将广播数据录制到本地 JSONL 文件。"""
+
+    def __init__(self, output_dir: Path = RECORDINGS_DIR) -> None:
+        self.output_dir = output_dir
+        self.recording = False
+        self.recorded_frames = 0
+        self._file: Optional[TextIO] = None
+        self._path: Optional[Path] = None
+
+    @property
+    def output_path(self) -> Optional[Path]:
+        return self._path
+
+    def start(self) -> Path:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._path = self.output_dir / (
+            f"joint_angles_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+        )
+        self._file = self._path.open("w", encoding="utf-8")
+        self._file.write(json.dumps({
+            "type": "session_start",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False) + "\n")
+        self.recording = True
+        self.recorded_frames = 0
+        print(f"[录制] 已开始 → {self._path}")
+        return self._path
+
+    def stop(self) -> None:
+        if not self.recording or self._file is None:
+            return
+        self._file.write(json.dumps({
+            "type": "session_end",
+            "ended_at": datetime.now().isoformat(timespec="seconds"),
+            "total_frames": self.recorded_frames,
+        }, ensure_ascii=False) + "\n")
+        self._file.close()
+        self._file = None
+        print(f"[录制] 已停止，共 {self.recorded_frames} 帧 → {self._path}")
+        self.recording = False
+
+    def toggle(self) -> bool:
+        if self.recording:
+            self.stop()
+        else:
+            self.start()
+        return self.recording
+
+    def write(self, packet: dict) -> None:
+        if not self.recording or self._file is None:
+            return
+        payload = build_broadcast_payload(packet)
+        self._file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.recorded_frames += 1
 
 
 class PoseCaptureWorker:
@@ -458,17 +533,13 @@ class PoseCaptureWorker:
             "source": source,
         }
 
-    @staticmethod
-    def _camera_to_unity_absolute(point_cam: np.ndarray) -> np.ndarray:
-        """相机坐标 → Unity 世界绝对位置（+Y 上，+Z 脸）。"""
-        return np.array([point_cam[0], -point_cam[1], -point_cam[2]], dtype=np.float64)
 
     def _build_world_keypoints(
         self,
         landmarks_2d,
         world_landmarks,
         depth_frame,
-    ) -> tuple[list[dict], Optional[np.ndarray]]:
+    ) -> list[dict]:
         """使用 pose_world_landmarks，输出 Unity 坐标（髋为原点，+Y 头，+Z 脸）。"""
         depth_points = self._collect_depth_points_for_scale(landmarks_2d, depth_frame)
         scale = self._estimate_world_scale(world_landmarks, depth_points)
@@ -478,17 +549,6 @@ class PoseCaptureWorker:
             + self._world_vec(world_landmarks[PoseLandmark.RIGHT_HIP])
         )
 
-        pelvis_abs: Optional[np.ndarray] = None
-        if (
-            PoseLandmark.LEFT_HIP in depth_points
-            and PoseLandmark.RIGHT_HIP in depth_points
-        ):
-            hip_cam = 0.5 * (
-                depth_points[PoseLandmark.LEFT_HIP]
-                + depth_points[PoseLandmark.RIGHT_HIP]
-            )
-            pelvis_abs = self._camera_to_unity_absolute(hip_cam)
-
         keypoints = []
         for idx, landmark in enumerate(landmarks_2d):
             relative_world = self._world_vec(world_landmarks[idx]) - hip_world
@@ -496,7 +556,7 @@ class PoseCaptureWorker:
             confidence = landmark.visibility if landmark.visibility is not None else 0.0
             keypoints.append(self._make_keypoint(idx, point, confidence, "world"))
 
-        return keypoints, pelvis_abs
+        return keypoints
 
     def _apply_one_euro_filter(
         self, keypoints: list[dict], timestamp: float
@@ -682,14 +742,14 @@ class PoseCaptureWorker:
             keypoints: list[dict] = []
 
             if results.pose_landmarks and results.pose_world_landmarks:
-                raw_keypoints, pelvis_abs = self._build_world_keypoints(
+                raw_keypoints = self._build_world_keypoints(
                     results.pose_landmarks[0],
                     results.pose_world_landmarks[0],
                     depth_frame,
                 )
                 keypoints = self._apply_one_euro_filter(raw_keypoints, timestamp)
                 self.forward_kinematics.update_lengths(keypoints)
-                joint_angles = self.joint_calculator.compute(keypoints, pelvis_abs)
+                joint_angles = self.joint_calculator.compute(keypoints)
 
                 drawing_utils.draw_landmarks(
                     color_image,
@@ -750,20 +810,53 @@ class MotionCaptureApp:
         self.forward_kinematics = ForwardKinematics()
         self.start_time = time.time()
         self.frame_count = 0
+        self.recorder = BroadcastRecorder()
+        self._record_btn_rect: tuple[int, int, int, int] = (0, 0, 0, 0)
 
     def _init_visualizers(self) -> None:
         if LOCAL_DEBUG:
             self.visualizer = Pose3DVisualizer(self.pose_connections)
             self.fk_visualizer = ReconstructedPoseVisualizer()
+            cv2.namedWindow(CV_WINDOW_NAME)
+            cv2.setMouseCallback(CV_WINDOW_NAME, self._on_mouse)
             print("[主进程] 3D 可视化窗口已创建（MediaPipe World + 关节角 FK 对比）")
+            print("[主进程] 点击 REC 按钮或按 R 键开始/停止录制")
+
+    def _on_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        x1, y1, x2, y2 = self._record_btn_rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            self.recorder.toggle()
+
+    def _draw_record_button(self, image: np.ndarray) -> None:
+        h, w = image.shape[:2]
+        bw, bh = 150, 40
+        x1, y1 = 10, h - bh - 10
+        x2, y2 = x1 + bw, y1 + bh
+        self._record_btn_rect = (x1, y1, x2, y2)
+
+        bg = (0, 0, 200) if self.recorder.recording else (50, 50, 50)
+        cv2.rectangle(image, (x1, y1), (x2, y2), bg, -1)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255), 2)
+        label = "STOP REC" if self.recorder.recording else "REC"
+        cv2.putText(image, label, (x1 + 12, y1 + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        if self.recorder.recording:
+            cv2.circle(image, (x2 - 18, y1 + bh // 2), 7, (0, 0, 255), -1)
+            cv2.putText(image, str(self.recorder.recorded_frames),
+                        (x2 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     def _handle_frame(self, packet: dict) -> None:
         self.frame_count += 1
         keypoints = packet.get("keypoints", [])
         joint_angles = packet.get("joint_angles", {})
-        color_image = packet["color_image"]
+        color_image = packet["color_image"].copy()
 
-        cv2.imshow("Motion Capture (Local Debug)", color_image)
+        self.recorder.write(packet)
+        self._draw_record_button(color_image)
+
+        cv2.imshow(CV_WINDOW_NAME, color_image)
 
         if self.visualizer and keypoints:
             self.visualizer.update(keypoints)
@@ -811,11 +904,14 @@ class MotionCaptureApp:
                 if latest is not None:
                     self._handle_frame(latest)
 
-                if cv2.pollKey() & 0xFF == ord("q"):
+                pump_matplotlib_events()
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     print("[主进程] 用户请求退出")
                     break
+                if key == ord("r"):
+                    self.recorder.toggle()
 
-                pump_matplotlib_events()
                 time.sleep(0.005)
 
         except KeyboardInterrupt:
@@ -825,6 +921,7 @@ class MotionCaptureApp:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.recorder.stop()
         if self.capture_process.is_alive():
             self.capture_process.join(timeout=8.0)
             if self.capture_process.is_alive():

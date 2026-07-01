@@ -3,22 +3,45 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+import os
+from typing import TYPE_CHECKING, Optional
 
-import matplotlib
-
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
 import numpy as np
 
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
 
-def figure_is_alive(fig: plt.Figure) -> bool:
-    return plt.fignum_exists(fig.number)
+_plt_module = None
+
+
+def _plt():
+    """延迟加载 matplotlib；子进程使用 Agg 后端，避免与 OpenCV GUI 争用 GIL。"""
+    global _plt_module
+    if _plt_module is not None:
+        return _plt_module
+
+    import matplotlib
+    backend = os.environ.get("MPLBACKEND", matplotlib.get_backend()).lower()
+    if backend == "agg":
+        import matplotlib.pyplot as plt
+    else:
+        if not backend.endswith("agg"):
+            matplotlib.use("TkAgg", force=False)
+        import matplotlib.pyplot as plt
+    _plt_module = plt
+    return plt
+
+
+def figure_is_alive(fig) -> bool:
+    return _plt().fignum_exists(fig.number)
 
 
 def pump_matplotlib_events() -> None:
     """统一处理 matplotlib GUI 事件，避免与 OpenCV waitKey 冲突。"""
-    plt.pause(0.001)
+    import matplotlib
+    if matplotlib.get_backend().lower() == "agg":
+        return
+    _plt().pause(0.001)
 
 # MediaPipe PoseLandmark 索引
 MP = {
@@ -34,7 +57,6 @@ JOINT_ANGLE_KEYS = [
     "Elbow_rAX", "Elbow_rAY", "Elbow_lAX", "Elbow_lAY",
     "Wrist_rAX", "Wrist_lAX",
     "Pelvis_AX", "Pelvis_AY", "Pelvis_AZ",
-    "Pelvis_DX", "Pelvis_DY", "Pelvis_DZ",
 ]
 
 FK_CONNECTIONS = [
@@ -248,10 +270,20 @@ def _knee_shank_dir(
     az_deg: float,
     side: str,
 ) -> np.ndarray:
-    """由膝角重建小腿方向。"""
+    """由膝角重建小腿方向。
+
+    膝为铰链关节，主要自由度是伸/屈角 (ext_deg)。
+    - 去掉 az_deg 预旋转：az 由 atan2(x,z) 求得，小腿近竖直时极不稳定，
+      直接作用会在不同帧产生任意扭曲。
+    - 近伸直时 (|ext_deg|<12°) ay 也无法稳定定义（atan2 分子接近 0），
+      直接返回纯伸直方向，不做旋转搜索。
+    """
     x_axis, y_axis, _z_axis = _elbow_frame(thigh_dir, R_body)
     shank = _rotate_vector(y_axis, x_axis, math.radians(-ext_deg))
-    shank = _rotate_vector(shank, y_axis, math.radians(az_deg))
+
+    if abs(ext_deg) < 12.0:
+        return _normalize(shank)
+
     best_dir = shank
     best_err = 1e9
     for step in range(72):
@@ -272,9 +304,6 @@ def _knee_shank_dir(
 
 class JointAngleCalculator:
     """从 Unity 关键点计算图中定义的关节角（度）。"""
-
-    def __init__(self) -> None:
-        self.pelvis_reference: Optional[np.ndarray] = None
 
     def _build_body_frame(self, pts: dict[int, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
         return _build_body_frame(pts)
@@ -302,7 +331,12 @@ class JointAngleCalculator:
         shank_local = self._local_dir(R, knee, ankle)
         ay = _deg(math.atan2(-shank_local[0], shank_local[1])) if side == "r" else _deg(
             math.atan2(shank_local[0], shank_local[1]))
-        az = _deg(math.atan2(shank_local[0], shank_local[2]))
+        # 站立时小腿近竖直，x/z 分量很小，atan2 极不稳定，会导致 FK 膝部约 90° 抖动
+        xz = math.hypot(float(shank_local[0]), float(shank_local[2]))
+        if xz < 0.12:
+            az = 0.0
+        else:
+            az = _deg(math.atan2(shank_local[0], shank_local[2]))
         return ax, ay, az
 
     def _ankle_angles(
@@ -346,28 +380,15 @@ class JointAngleCalculator:
         ax = _angle_between(fore, ref) - 90.0
         return ax if side == "r" else -ax
 
-    def compute(
-        self,
-        keypoints: list[dict],
-        pelvis_position: Optional[np.ndarray] = None,
-    ) -> dict[str, float]:
+    def compute(self, keypoints: list[dict]) -> dict[str, float]:
         pts = _kps_array(keypoints)
         origin, R_body = self._build_body_frame(pts)
         ax_p, ay_p, az_p = _euler_xyz(R_body)
         angles: dict[str, float] = {k: 0.0 for k in JOINT_ANGLE_KEYS}
 
-        if pelvis_position is None:
-            pelvis_position = origin
-        if self.pelvis_reference is None:
-            self.pelvis_reference = pelvis_position.copy()
-        delta = pelvis_position - self.pelvis_reference
-
         angles["Pelvis_AX"] = _deg(ax_p)
         angles["Pelvis_AY"] = _deg(ay_p)
         angles["Pelvis_AZ"] = _deg(az_p)
-        angles["Pelvis_DX"] = float(delta[0])
-        angles["Pelvis_DY"] = float(delta[1])
-        angles["Pelvis_DZ"] = float(delta[2])
 
         hr_ax, hr_ay, hr_az = self._hip_angles(R_body, pts[MP["RH"]], pts[MP["RK"]], "r")
         hl_ax, hl_ay, hl_az = self._hip_angles(R_body, pts[MP["LH"]], pts[MP["LK"]], "l")
@@ -450,9 +471,7 @@ class ForwardKinematics:
         return self.anchor_offsets.get(name, default)
 
     def rebuild(self, angles: dict[str, float]) -> dict[str, np.ndarray]:
-        pos = np.array([
-            angles["Pelvis_DX"], angles["Pelvis_DY"], angles["Pelvis_DZ"]
-        ], dtype=np.float64)
+        pos = np.zeros(3, dtype=np.float64)
         R = (
             _rotation_z(math.radians(angles["Pelvis_AZ"]))
             @ _rotation_y(math.radians(angles["Pelvis_AY"]))
@@ -514,6 +533,7 @@ class ReconstructedPoseVisualizer:
     """由关节角 FK 重建的 3D 骨架窗口（与原始关键点窗口对比）。"""
 
     def __init__(self) -> None:
+        plt = _plt()
         plt.ion()
         self._closed = False
         self.fig = plt.figure("3D Pose (Joint Angles FK)", figsize=(8, 8))
@@ -571,5 +591,6 @@ class ReconstructedPoseVisualizer:
         self.fig.canvas.draw_idle()
 
     def close(self) -> None:
+        plt = _plt()
         plt.ioff()
         plt.close(self.fig)

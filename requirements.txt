@@ -4,3 +4,8 @@ mediapipe
 pyrealsense2
 ultralytics
 matplotlib
+
+# ZED 2i Body Tracking（zed_bodytracking.py）需单独安装 Stereolabs ZED SDK 与 pyzed：
+# 1. 下载安装 ZED SDK 4.x+：https://www.stereolabs.com/developers/release/
+# 2. 运行 SDK 目录下的 get_python_api.py 生成 whl，再 pip install <生成的 whl>
+# 3. pyzed 无法通过 pip install pyzed 直接安装
