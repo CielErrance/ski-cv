@@ -59,12 +59,22 @@ ZED_TO_MP: dict[int, int] = {
     ZED["RIGHT_ELBOW"]: MP["RE"],
     ZED["LEFT_WRIST"]: MP["LW"],
     ZED["RIGHT_WRIST"]: MP["RW"],
+    ZED["LEFT_HANDTIP"]: MP["LI"],
+    ZED["RIGHT_HANDTIP"]: MP["RI"],
+    ZED["LEFT_THUMB"]: MP["LT"],
+    ZED["RIGHT_THUMB"]: MP["RT"],
+    ZED["LEFT_HAND"]: MP["LP"],
+    ZED["RIGHT_HAND"]: MP["RP"],
     ZED["LEFT_HIP"]: MP["LH"],
     ZED["RIGHT_HIP"]: MP["RH"],
     ZED["LEFT_KNEE"]: MP["LK"],
     ZED["RIGHT_KNEE"]: MP["RK"],
     ZED["LEFT_ANKLE"]: MP["LA"],
     ZED["RIGHT_ANKLE"]: MP["RA"],
+    ZED["LEFT_FOOT"]: MP["LFI"],
+    ZED["RIGHT_FOOT"]: MP["RFI"],
+    ZED["LEFT_HEEL"]: MP["LHE"],
+    ZED["RIGHT_HEEL"]: MP["RHE"],
 }
 
 MP_NAMES = {
@@ -74,12 +84,22 @@ MP_NAMES = {
     MP["RE"]: "RIGHT_ELBOW",
     MP["LW"]: "LEFT_WRIST",
     MP["RW"]: "RIGHT_WRIST",
+    MP["LP"]: "LEFT_PINKY",
+    MP["RP"]: "RIGHT_PINKY",
+    MP["LI"]: "LEFT_INDEX",
+    MP["RI"]: "RIGHT_INDEX",
+    MP["LT"]: "LEFT_THUMB",
+    MP["RT"]: "RIGHT_THUMB",
     MP["LH"]: "LEFT_HIP",
     MP["RH"]: "RIGHT_HIP",
     MP["LK"]: "LEFT_KNEE",
     MP["RK"]: "RIGHT_KNEE",
     MP["LA"]: "LEFT_ANKLE",
     MP["RA"]: "RIGHT_ANKLE",
+    MP["LHE"]: "LEFT_HEEL",
+    MP["RHE"]: "RIGHT_HEEL",
+    MP["LFI"]: "LEFT_FOOT_INDEX",
+    MP["RFI"]: "RIGHT_FOOT_INDEX",
 }
 
 # sl::BODY_34_BONES（Camera.hpp）
@@ -226,21 +246,12 @@ def zed_all_keypoints_to_unity(body: Any) -> list[dict]:
 
 
 def zed_viz_keypoints_to_unity(body: Any) -> list[dict]:
-    """34 点可视化坐标：Y 取反以匹配 matplotlib / MediaPipe 绘图约定。"""
-    keypoints = zed_all_keypoints_to_unity(body)
-    if not keypoints:
-        return []
-    viz = []
-    for kp in keypoints:
-        item = dict(kp)
-        if item["source"] == "zed":
-            item["y"] = -item["y"]
-        viz.append(item)
-    return viz
+    """34 点 Unity 坐标（与关节角/FK 同一约定），供 3D 可视化。"""
+    return zed_all_keypoints_to_unity(body)
 
 
 def zed_keypoints_to_unity(body: Any) -> list[dict]:
-    """ZED BodyData → MediaPipe 兼容 33 点（仅 12 点有效），供关节角计算。"""
+    """ZED BodyData → MediaPipe 兼容 33 点（躯干/肢段 + 手/脚标记），供关节角计算。"""
     hip_world = _hip_center(body)
     if hip_world is None:
         return []

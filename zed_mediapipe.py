@@ -1,26 +1,43 @@
-"""ZED 2i Body Tracking 关节角采集（多进程 GUI，输出格式与 RealSense 版一致）。"""
+"""ZED 相机 + MediaPipe 姿态检测关节角采集（多进程 GUI）。
+
+使用 ZED 左目 RGB 运行 MediaPipe PoseLandmarker，并用 ZED 深度/点云
+校正 world landmarks 的米制尺度；输出格式与 realsense_mediapipe.py 一致。
+
+运行（请先 conda activate ski）:
+    python zed_mediapipe.py
+"""
 
 from __future__ import annotations
 
 import multiprocessing as mp_ctx
 import os
 import time
-
-# 主进程固定 TkAgg；子进程用 Agg，避免与 OpenCV GUI 争用 GIL
-if mp_ctx.current_process().name == "MainProcess":
-    import matplotlib
-    matplotlib.use("TkAgg", force=True)
-else:
-    os.environ.setdefault("MPLBACKEND", "Agg")
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Full
 from typing import Optional
 
 import cv2
+import mediapipe
 import numpy as np
 import pyzed.sl as sl
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import (
+    PoseLandmarker,
+    PoseLandmarkerOptions,
+    RunningMode,
+    drawing_utils,
+)
+from mediapipe.tasks.python.vision.pose_landmarker import (
+    PoseLandmark,
+    PoseLandmarksConnections,
+)
 
-from datetime import datetime
+if mp_ctx.current_process().name == "MainProcess":
+    import matplotlib
+    matplotlib.use("TkAgg", force=True)
+else:
+    os.environ.setdefault("MPLBACKEND", "Agg")
 
 from joint_angles import (
     CombinedPose3DVisualizer,
@@ -30,61 +47,31 @@ from joint_angles import (
 from realsense_mediapipe import (
     BroadcastRecorder,
     OneEuroFilter3D,
-)
-from zed_skeleton import (
-    NUM_MP_KEYPOINTS,
-    NUM_ZED_KEYPOINTS,
-    draw_skeleton_2d,
-    zed_body34_connections,
-    zed_keypoints_to_unity,
-    zed_viz_keypoints_to_unity,
+    ensure_pose_model,
 )
 
 LOCAL_DEBUG = True
-FRAME_TIMEOUT_MS = 10000
 WARMUP_GRAB_COUNT = 30
-BODY_DETECTION_CONFIDENCE = 40
-CV_WINDOW_NAME = "Motion Capture (ZED)"
-CV_DISPLAY_WIDTH = 960  # 相机窗口显示宽度（原图 1280 缩至此）
-RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
+DEPTH_SAMPLE_RADIUS = 2
+MIN_VALID_DEPTH_M = 0.2
+MAX_VALID_DEPTH_M = 5.0
+NUM_KEYPOINTS = 33
 
 ENABLE_ONE_EURO_FILTER = True
 KEYPOINT_CONF_THRESHOLD = 0.0
-FK_KNEE_SMOOTH_ALPHA = 0.15  # 越小越平滑，0.15 ≈ 时间常数约 6 帧@30fps
+
+CV_WINDOW_NAME = "Motion Capture (ZED + MediaPipe)"
+CV_DISPLAY_WIDTH = 960
+RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
 
 
-class FKAngleSmoother:
-    """仅用于 FK 可视化：平滑膝部关节角，避免偶发帧抖动。
-
-    录制数据不经过此平滑，保留原始角度。
-    对 Knee_AX/AY/AZ 均做 EMA，以抑制 ZED 关键点位置噪声。
-    """
-
-    def __init__(self, alpha: float = FK_KNEE_SMOOTH_ALPHA) -> None:
-        self.alpha = alpha
-        self._prev: dict[str, float] = {}
-
-    def for_fk(self, angles: dict[str, float]) -> dict[str, float]:
-        if not angles:
-            return angles
-        out = dict(angles)
-        for key in angles:
-            if not key.startswith("Knee_"):
-                continue
-            val = angles[key]
-            if key in self._prev:
-                out[key] = self.alpha * val + (1.0 - self.alpha) * self._prev[key]
-            self._prev[key] = out[key]
-        return out
-
-
-class ZEDBroadcastRecorder(BroadcastRecorder):
-    """录制文件名使用 joint_angles_zed_ 前缀以区分设备。"""
+class ZEDMPBroadcastRecorder(BroadcastRecorder):
+    """录制文件名使用 joint_angles_zed_mp_ 前缀。"""
 
     def start(self) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._path = self.output_dir / (
-            f"joint_angles_zed_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+            f"joint_angles_zed_mp_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
         )
         import json
 
@@ -99,23 +86,145 @@ class ZEDBroadcastRecorder(BroadcastRecorder):
         return self._path
 
 
-class ZEDCaptureWorker:
-    """子进程：ZED 取流 + Body Tracking + 关节角计算（无 GUI）。"""
+class ZEDMediaPipeCaptureWorker:
+    """子进程：ZED 取流 + MediaPipe 推理 + 关节角计算（无 GUI）。"""
 
     def __init__(self) -> None:
         self.zed: Optional[sl.Camera] = None
+        self.pose_landmarker: Optional[PoseLandmarker] = None
+        self.pose_connections = PoseLandmarksConnections.POSE_LANDMARKS
         self.frame_count = 0
+        self.frame_timestamp_ms = 0
         self.start_time = time.time()
         self.camera_initialized = False
         self._frame_error_count = 0
-        self._image_scale = 1.0
-        self.one_euro_filters = [OneEuroFilter3D() for _ in range(NUM_MP_KEYPOINTS)]
+        self._last_world_scale = 1.0
+        self._image_width = 1280
+        self._image_height = 720
+        self.one_euro_filters = [OneEuroFilter3D() for _ in range(NUM_KEYPOINTS)]
         self.joint_calculator = JointAngleCalculator()
         self.forward_kinematics = ForwardKinematics()
-        self._bodies = sl.Bodies()
         self._image = sl.Mat()
-        self._body_runtime = sl.BodyTrackingRuntimeParameters()
-        self._body_runtime.detection_confidence_threshold = BODY_DETECTION_CONFIDENCE
+        self._xyz = sl.Mat()
+
+    @staticmethod
+    def _landmark_pixel(landmark, width: int, height: int) -> tuple[int, int]:
+        return int(landmark.x * width), int(landmark.y * height)
+
+    @staticmethod
+    def _world_vec(landmark) -> np.ndarray:
+        return np.array([landmark.x, landmark.y, landmark.z], dtype=np.float64)
+
+    @staticmethod
+    def _world_to_unity(relative_world: np.ndarray, scale: float) -> np.ndarray:
+        """MediaPipe world → Unity（髋原点，+Y 头，+Z 脸）。"""
+        return np.array([
+            relative_world[0] * scale,
+            -relative_world[1] * scale,
+            relative_world[2] * scale,
+        ], dtype=np.float64)
+
+    def _sample_xyz_m(self, x_px: int, y_px: int) -> Optional[np.ndarray]:
+        """从左目对齐的 XYZ 点云读取相机坐标系下的 3D 点（米）。"""
+        if not (0 <= x_px < self._image_width and 0 <= y_px < self._image_height):
+            return None
+
+        samples: list[np.ndarray] = []
+        for dy in range(-DEPTH_SAMPLE_RADIUS, DEPTH_SAMPLE_RADIUS + 1):
+            for dx in range(-DEPTH_SAMPLE_RADIUS, DEPTH_SAMPLE_RADIUS + 1):
+                px, py = x_px + dx, y_px + dy
+                if not (0 <= px < self._image_width and 0 <= py < self._image_height):
+                    continue
+                err, value = self._xyz.get_value(px, py)
+                if err != sl.ERROR_CODE.SUCCESS:
+                    continue
+                point = np.array([float(value[0]), float(value[1]), float(value[2])])
+                if not np.all(np.isfinite(point)):
+                    continue
+                depth_forward = point[2]
+                if MIN_VALID_DEPTH_M < depth_forward < MAX_VALID_DEPTH_M:
+                    samples.append(point)
+
+        if not samples:
+            return None
+        return np.median(samples, axis=0)
+
+    def _collect_depth_points_for_scale(
+        self,
+        landmarks_2d,
+    ) -> dict[int, np.ndarray]:
+        depth_points: dict[int, np.ndarray] = {}
+        for idx, landmark in enumerate(landmarks_2d):
+            x_px, y_px = self._landmark_pixel(
+                landmark, self._image_width, self._image_height,
+            )
+            point = self._sample_xyz_m(x_px, y_px)
+            if point is not None:
+                depth_points[idx] = point
+        return depth_points
+
+    def _estimate_world_scale(
+        self,
+        world_landmarks,
+        depth_points: dict[int, np.ndarray],
+    ) -> float:
+        scale_candidates: list[float] = []
+
+        def add_pair_scale(idx_a: int, idx_b: int) -> None:
+            if idx_a not in depth_points or idx_b not in depth_points:
+                return
+            real_dist = float(np.linalg.norm(depth_points[idx_a] - depth_points[idx_b]))
+            world_dist = float(np.linalg.norm(
+                self._world_vec(world_landmarks[idx_a])
+                - self._world_vec(world_landmarks[idx_b])
+            ))
+            if world_dist > 1e-4 and real_dist > 1e-4:
+                scale_candidates.append(real_dist / world_dist)
+
+        add_pair_scale(PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER)
+        add_pair_scale(PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP)
+
+        if scale_candidates:
+            return float(np.median(scale_candidates))
+        return self._last_world_scale
+
+    def _make_keypoint(
+        self,
+        idx: int,
+        point: np.ndarray,
+        confidence: float,
+        source: str,
+    ) -> dict:
+        return {
+            "id": idx,
+            "name": PoseLandmark(idx).name,
+            "x": float(point[0]),
+            "y": float(point[1]),
+            "z": float(point[2]),
+            "confidence": confidence,
+            "source": source,
+        }
+
+    def _build_world_keypoints(
+        self,
+        landmarks_2d,
+        world_landmarks,
+    ) -> list[dict]:
+        depth_points = self._collect_depth_points_for_scale(landmarks_2d)
+        scale = self._estimate_world_scale(world_landmarks, depth_points)
+        self._last_world_scale = scale
+        hip_world = 0.5 * (
+            self._world_vec(world_landmarks[PoseLandmark.LEFT_HIP])
+            + self._world_vec(world_landmarks[PoseLandmark.RIGHT_HIP])
+        )
+
+        keypoints: list[dict] = []
+        for idx, landmark in enumerate(landmarks_2d):
+            relative_world = self._world_vec(world_landmarks[idx]) - hip_world
+            point = self._world_to_unity(relative_world, scale)
+            confidence = landmark.visibility if landmark.visibility is not None else 0.0
+            keypoints.append(self._make_keypoint(idx, point, confidence, "zed_mp"))
+        return keypoints
 
     def _apply_one_euro_filter(
         self, keypoints: list[dict], timestamp: float
@@ -137,25 +246,26 @@ class ZEDCaptureWorker:
             })
         return filtered_keypoints
 
-    @staticmethod
-    def _select_body(body_list) -> Optional[object]:
-        if not body_list:
-            return None
-        best = body_list[0]
-        best_conf = getattr(best, "confidence", 0.0) or 0.0
-        for body in body_list[1:]:
-            conf = getattr(body, "confidence", 0.0) or 0.0
-            if conf > best_conf:
-                best = body
-                best_conf = conf
-        return best
-
     def _warmup_camera(self) -> None:
         print(f"正在预热 ZED（丢弃前 {WARMUP_GRAB_COUNT} 帧）...")
         for i in range(WARMUP_GRAB_COUNT):
             if self.zed.grab() != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"预热第 {i + 1}/{WARMUP_GRAB_COUNT} 帧 grab 失败")
         print("ZED 预热完成")
+
+    def _init_pose_landmarker(self) -> None:
+        print("正在加载 MediaPipe 姿态检测模型...")
+        model_path = str(ensure_pose_model())
+        options = PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.7,
+            min_pose_presence_confidence=0.7,
+            min_tracking_confidence=0.7,
+        )
+        self.pose_landmarker = PoseLandmarker.create_from_options(options)
+        print("MediaPipe 模型加载完成")
 
     def initialize(self) -> None:
         print("[采集进程] 正在初始化 ZED 相机...")
@@ -177,7 +287,7 @@ class ZEDCaptureWorker:
         last_status = sl.ERROR_CODE.CAMERA_NOT_DETECTED
         for attempt in range(3):
             if attempt > 0:
-                print(f"打开失败，{2.0:.0f}s 后重试 ({attempt + 1}/3)...")
+                print(f"打开失败，2s 后重试 ({attempt + 1}/3)...")
                 time.sleep(2.0)
                 if self.zed is not None:
                     try:
@@ -195,48 +305,27 @@ class ZEDCaptureWorker:
         else:
             raise RuntimeError(
                 f"无法打开 ZED 相机: {last_status}\n"
-                "请确认:\n"
-                "1. 已关闭 ZED Explorer 及其他占用相机的程序\n"
-                "2. 无其他 zed_bodytracking.py / python 实例在运行（任务管理器结束 python.exe）\n"
-                "3. 重新插拔 USB 后等待 5 秒再试"
+                "请确认已关闭 ZED Explorer 及其他占用相机的程序。"
             )
 
         cam_info = self.zed.get_camera_information()
-        serial = cam_info.serial_number if cam_info else "unknown"
+        res = cam_info.camera_configuration.resolution
+        self._image_width = res.width
+        self._image_height = res.height
         model = cam_info.camera_model if cam_info else "ZED"
-        print(f"检测到设备: {model} (SN: {serial})")
-
-        tracking_params = sl.PositionalTrackingParameters()
-        tracking_params.set_floor_as_origin = True
-        status = self.zed.enable_positional_tracking(tracking_params)
-        if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Positional Tracking 启用失败: {status}")
-
-        body_params = sl.BodyTrackingParameters()
-        body_params.detection_model = sl.BODY_TRACKING_MODEL.HUMAN_BODY_ACCURATE
-        body_params.body_format = sl.BODY_FORMAT.BODY_34
-        body_params.enable_tracking = True
-        body_params.enable_body_fitting = True
-        status = self.zed.enable_body_tracking(body_params)
-        if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Body Tracking 启用失败: {status}")
+        serial = cam_info.serial_number if cam_info else "unknown"
+        print(f"检测到设备: {model} (SN: {serial}, {self._image_width}x{self._image_height})")
 
         self._warmup_camera()
-
+        self._init_pose_landmarker()
         self.camera_initialized = True
-        print("[采集进程] ZED 初始化成功！")
+        print("[采集进程] ZED + MediaPipe 初始化成功！")
 
     def shutdown(self) -> None:
+        if self.pose_landmarker is not None:
+            self.pose_landmarker.close()
+            self.pose_landmarker = None
         if self.zed is not None:
-            if self.camera_initialized:
-                try:
-                    self.zed.disable_body_tracking()
-                except Exception:
-                    pass
-                try:
-                    self.zed.disable_positional_tracking()
-                except Exception:
-                    pass
             try:
                 self.zed.close()
             except Exception:
@@ -275,7 +364,7 @@ class ZEDCaptureWorker:
             self.shutdown()
 
     def process_frame(self) -> Optional[dict]:
-        if not self.camera_initialized or self.zed is None:
+        if not self.camera_initialized or self.zed is None or self.pose_landmarker is None:
             return None
 
         frame_start = time.time()
@@ -286,38 +375,65 @@ class ZEDCaptureWorker:
                 return None
 
             self.zed.retrieve_image(self._image, sl.VIEW.LEFT)
-            self.zed.retrieve_bodies(self._bodies, self._body_runtime)
+            self.zed.retrieve_measure(self._xyz, sl.MEASURE.XYZ)
 
             color_image = self._image.get_data()
             if color_image is None:
                 return None
             color_image = np.ascontiguousarray(color_image.copy())
-            self._image_scale = self._image.get_width() / 1280.0
+
+            if color_image.shape[2] == 4:
+                bgr_image = cv2.cvtColor(color_image, cv2.COLOR_BGRA2BGR)
+            elif color_image.shape[2] == 3:
+                bgr_image = color_image
+            else:
+                raise ValueError(f"不支持的 ZED 图像通道数: {color_image.shape[2]}")
+            rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+
+            mp_image = mediapipe.Image(
+                image_format=mediapipe.ImageFormat.SRGB, data=rgb_image,
+            )
+            self.frame_timestamp_ms += 33
+            results = self.pose_landmarker.detect_for_video(
+                mp_image, self.frame_timestamp_ms,
+            )
 
             timestamp = time.time()
             joint_angles: dict = {}
             keypoints: list[dict] = []
-            viz_keypoints: list[dict] = []
 
-            body = self._select_body(self._bodies.body_list)
-            body_count = len(self._bodies.body_list)
-            if body is not None:
-                viz_keypoints = zed_viz_keypoints_to_unity(body)
-                raw_keypoints = zed_keypoints_to_unity(body)
-                if raw_keypoints:
-                    keypoints = self._apply_one_euro_filter(raw_keypoints, timestamp)
-                    self.forward_kinematics.update_lengths(keypoints)
-                    joint_angles = self.joint_calculator.compute(keypoints)
-                draw_skeleton_2d(color_image, body, self._image_scale)
+            if results.pose_landmarks and results.pose_world_landmarks:
+                raw_keypoints = self._build_world_keypoints(
+                    results.pose_landmarks[0],
+                    results.pose_world_landmarks[0],
+                )
+                keypoints = self._apply_one_euro_filter(raw_keypoints, timestamp)
+                self.forward_kinematics.update_lengths(keypoints)
+                joint_angles = self.joint_calculator.compute(keypoints)
+
+                drawing_utils.draw_landmarks(
+                    bgr_image,
+                    results.pose_landmarks[0],
+                    self.pose_connections,
+                    drawing_utils.DrawingSpec(
+                        color=(0, 255, 0), thickness=2, circle_radius=2),
+                    drawing_utils.DrawingSpec(
+                        color=(255, 0, 0), thickness=2, circle_radius=2),
+                )
 
             elapsed = time.time() - frame_start
             fps = 1.0 / elapsed if elapsed > 0 else 0.0
-            valid_count = sum(1 for kp in viz_keypoints if kp.get("source") == "zed")
-            cv2.putText(color_image, f"FPS: {fps:.1f}", (10, 30),
+            valid_count = sum(1 for kp in keypoints if kp.get("source") == "zed_mp")
+            scale_txt = f" scale={self._last_world_scale:.2f}" if keypoints else ""
+            cv2.putText(bgr_image, f"FPS: {fps:.1f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(color_image, f"Bodies: {body_count}  Nodes: {valid_count}/{NUM_ZED_KEYPOINTS}", (10, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(color_image, "Joint Angles (ZED)", (10, 110),
+            cv2.putText(
+                bgr_image,
+                f"MP Nodes: {valid_count}/33{scale_txt}",
+                (10, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2,
+            )
+            cv2.putText(bgr_image, "ZED + MediaPipe", (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
 
             self._frame_error_count = 0
@@ -328,8 +444,7 @@ class ZEDCaptureWorker:
                 "fps": fps,
                 "joint_angles": joint_angles,
                 "keypoints": keypoints,
-                "viz_keypoints": viz_keypoints,
-                "color_image": color_image,
+                "color_image": bgr_image,
             }
 
         except Exception as e:
@@ -339,8 +454,8 @@ class ZEDCaptureWorker:
             return None
 
 
-class ZEDMotionCaptureApp:
-    """主进程：OpenCV + Matplotlib 可视化（与 ZED 采集进程隔离）。"""
+class ZEDMediaPipeApp:
+    """主进程：OpenCV + 3D 可视化（与采集进程隔离）。"""
 
     def __init__(
         self,
@@ -351,13 +466,12 @@ class ZEDMotionCaptureApp:
         self.frame_queue = frame_queue
         self.stop_event = stop_event
         self.capture_process = capture_process
-        self.pose_connections = zed_body34_connections()
+        self.pose_connections = PoseLandmarksConnections.POSE_LANDMARKS
         self.visualizer: Optional[CombinedPose3DVisualizer] = None
         self.forward_kinematics = ForwardKinematics()
         self.start_time = time.time()
         self.frame_count = 0
-        self.recorder = ZEDBroadcastRecorder(RECORDINGS_DIR)
-        self._fk_angle_smoother = FKAngleSmoother()
+        self.recorder = ZEDMPBroadcastRecorder(RECORDINGS_DIR)
         self._record_btn_rect: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._display_scale = 1.0
 
@@ -377,14 +491,14 @@ class ZEDMotionCaptureApp:
         if LOCAL_DEBUG:
             self.visualizer = CombinedPose3DVisualizer(
                 self.pose_connections,
-                raw_kp_valid=lambda kp: kp.get("source") == "zed",
-                raw_title="ZED BODY_34",
+                raw_kp_valid=lambda kp: kp.get("source") == "zed_mp",
+                raw_title="MediaPipe (ZED depth)",
                 fk_title="Joint Angles FK",
-                window_title="Motion Capture 3D (ZED)",
+                window_title="Motion Capture 3D (ZED + MediaPipe)",
             )
             cv2.namedWindow(CV_WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.setMouseCallback(CV_WINDOW_NAME, self._on_mouse)
-            print("[主进程] 3D 对比窗口已创建（左：ZED 骨架 | 右：FK 重建 | 轴测视角）")
+            print("[主进程] 3D 对比窗口已创建（左：MediaPipe | 右：FK 重建）")
             print("[主进程] 3D 窗口：左键拖拽旋转 | 滚轮缩放 | 双击重置视角")
             print("[主进程] 点击 REC 按钮或按 R 键开始/停止录制")
 
@@ -419,28 +533,25 @@ class ZEDMotionCaptureApp:
     def _handle_frame(self, packet: dict) -> None:
         self.frame_count += 1
         keypoints = packet.get("keypoints", [])
-        viz_keypoints = packet.get("viz_keypoints", keypoints)
         joint_angles = packet.get("joint_angles", {})
         color_image = packet["color_image"].copy()
 
         self.recorder.write(packet)
         self._draw_record_button(color_image)
-
         cv2.imshow(CV_WINDOW_NAME, self._prepare_display(color_image))
 
         if self.visualizer:
             fk_nodes = None
-            if joint_angles:
+            if joint_angles and keypoints:
                 self.forward_kinematics.update_lengths(keypoints)
-                fk_angles = self._fk_angle_smoother.for_fk(joint_angles)
-                fk_nodes = self.forward_kinematics.rebuild(fk_angles)
+                fk_nodes = self.forward_kinematics.rebuild(joint_angles)
             valid_count = sum(
-                1 for kp in viz_keypoints if kp.get("source") == "zed"
-            ) if viz_keypoints else 0
+                1 for kp in keypoints if kp.get("source") == "zed_mp"
+            ) if keypoints else 0
             self.visualizer.update(
-                viz_keypoints,
+                keypoints or None,
                 fk_nodes,
-                raw_title_suffix=f"({valid_count}/{NUM_ZED_KEYPOINTS})",
+                raw_title_suffix=f"({valid_count}/33)",
             )
 
     def _drain_queue(self) -> tuple[Optional[dict], bool]:
@@ -478,7 +589,6 @@ class ZEDMotionCaptureApp:
                 if latest is not None:
                     self._handle_frame(latest)
 
-                # 先处理 OpenCV 消息，再 flush matplotlib（避免 plt.pause 与 waitKey 争 GIL）
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     print("[主进程] 用户请求退出")
@@ -516,7 +626,7 @@ def capture_process_entry(
     frame_queue: mp_ctx.Queue,
     stop_event: mp_ctx.Event,
 ) -> None:
-    worker = ZEDCaptureWorker()
+    worker = ZEDMediaPipeCaptureWorker()
     worker.run(frame_queue, stop_event)
 
 
@@ -528,12 +638,12 @@ def main() -> None:
     capture_proc = ctx.Process(
         target=capture_process_entry,
         args=(frame_queue, stop_event),
-        name="ZEDCapture",
+        name="ZEDMediaPipeCapture",
         daemon=False,
     )
     capture_proc.start()
 
-    app = ZEDMotionCaptureApp(frame_queue, stop_event, capture_proc)
+    app = ZEDMediaPipeApp(frame_queue, stop_event, capture_proc)
     app.run()
 
 

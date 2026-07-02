@@ -1,17 +1,72 @@
-"""关节角计算（由 MediaPipe Unity 关键点）与正向运动学重建。"""
+"""关节角计算（MediaPipe / ZED Unity 关键点）与正向运动学重建。
+
+角度定义与符号约定见项目根目录可对照的 description.json；
+计算流程参照 localaxes_to_jointangles.py：相邻骨段旋转矩阵 → 欧拉角。
+3 DOF 关节的绕骨轴 twist 通过段坐标系构造规则锁死；Elbow_AZ、Wrist_AY、
+Ankle_AY 锁长轴自旋；Wrist_AZ 锁侧向。有手/脚标记时用真实点，否则回退近似。
+所有角度单位为弧度。
+"""
 
 from __future__ import annotations
 
-import math
 import os
 from typing import TYPE_CHECKING, Optional
 
+import cv2
 import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — 注册 3d 投影
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
 _plt_module = None
+
+# MediaPipe PoseLandmark 索引（33 点）
+MP = {
+    "LS": 11, "RS": 12, "LE": 13, "RE": 14, "LW": 15, "RW": 16,
+    "LP": 17, "RP": 18, "LI": 19, "RI": 20, "LT": 21, "RT": 22,
+    "LH": 23, "RH": 24, "LK": 25, "RK": 26, "LA": 27, "RA": 28,
+    "LHE": 29, "RHE": 30, "LFI": 31, "RFI": 32,
+}
+
+JOINT_ANGLE_KEYS = [
+    "Hip_rAX", "Hip_rAY", "Hip_rAZ", "Hip_lAX", "Hip_lAY", "Hip_lAZ",
+    "Knee_rAX", "Knee_rAY", "Knee_rAZ", "Knee_lAX", "Knee_lAY", "Knee_lAZ",
+    "Ankle_rAX", "Ankle_rAY", "Ankle_rAZ", "Ankle_lAX", "Ankle_lAY", "Ankle_lAZ",
+    "Arm_rAX", "Arm_rAY", "Arm_rAZ", "Arm_lAX", "Arm_lAY", "Arm_lAZ",
+    "Elbow_rAX", "Elbow_rAY", "Elbow_rAZ", "Elbow_lAX", "Elbow_lAY", "Elbow_lAZ",
+    "Wrist_rAX", "Wrist_rAY", "Wrist_rAZ", "Wrist_lAX", "Wrist_lAY", "Wrist_lAZ",
+    "Pelvis_AX", "Pelvis_AY", "Pelvis_AZ",
+]
+
+FK_CONNECTIONS = [
+    ("pelvis", "hip_l"), ("pelvis", "hip_r"),
+    ("hip_l", "knee_l"), ("knee_l", "ankle_l"), ("ankle_l", "foot_l"),
+    ("hip_r", "knee_r"), ("knee_r", "ankle_r"), ("ankle_r", "foot_r"),
+    ("pelvis", "shoulder_l"), ("pelvis", "shoulder_r"),
+    ("shoulder_l", "elbow_l"), ("elbow_l", "wrist_l"), ("wrist_l", "hand_l"),
+    ("shoulder_r", "elbow_r"), ("elbow_r", "wrist_r"), ("wrist_r", "hand_r"),
+]
+
+# 手/脚段默认骨长（米）；明显短于前臂/小腿，避免 FK 可视化过长
+DEFAULT_SEGMENT_LENGTHS: dict[str, float] = {
+    "hand_l": 0.10,
+    "hand_r": 0.10,
+    "foot_l": 0.12,
+    "foot_r": 0.12,
+}
+
+# 脚尖/指端最低置信度；低于此或几何异常时回退默认姿态
+DISTAL_MIN_CONF = 0.5
+# |dot(足段, 小腿)| 超过此值视为「与腿平行」的坏点
+FOOT_SHANK_PARALLEL_COS = 0.85
+
+# 轴测（二测）默认视角：同时看到 X/Y/Z 三个方向
+AXONOMETRIC_ELEV = 35.0
+AXONOMETRIC_AZIM = 45.0
 
 
 def _plt():
@@ -36,86 +91,160 @@ def figure_is_alive(fig) -> bool:
     return _plt().fignum_exists(fig.number)
 
 
-def pump_matplotlib_events() -> None:
-    """统一处理 matplotlib GUI 事件，避免与 OpenCV waitKey 冲突。"""
+def present_figure(fig) -> None:
+    """立即重绘 matplotlib 窗口（draw + flush_events，不用 plt.pause）。"""
     import matplotlib
-    if matplotlib.get_backend().lower() == "agg":
+    backend = matplotlib.get_backend().lower()
+    if backend == "agg" or backend.endswith("agg"):
         return
-    _plt().pause(0.001)
-
-# MediaPipe PoseLandmark 索引
-MP = {
-    "LS": 11, "RS": 12, "LE": 13, "RE": 14, "LW": 15, "RW": 16,
-    "LH": 23, "RH": 24, "LK": 25, "RK": 26, "LA": 27, "RA": 28,
-}
-
-JOINT_ANGLE_KEYS = [
-    "Hip_rAX", "Hip_rAY", "Hip_rAZ", "Hip_lAX", "Hip_lAY", "Hip_lAZ",
-    "Knee_rAX", "Knee_rAY", "Knee_rAZ", "Knee_lAX", "Knee_lAY", "Knee_lAZ",
-    "Ankle_rAX", "Ankle_rAZ", "Ankle_lAX", "Ankle_lAZ",
-    "Arm_rAX", "Arm_rAY", "Arm_rAZ", "Arm_lAX", "Arm_lAY", "Arm_lAZ",
-    "Elbow_rAX", "Elbow_rAY", "Elbow_lAX", "Elbow_lAY",
-    "Wrist_rAX", "Wrist_lAX",
-    "Pelvis_AX", "Pelvis_AY", "Pelvis_AZ",
-]
-
-FK_CONNECTIONS = [
-    ("pelvis", "hip_l"), ("pelvis", "hip_r"),
-    ("hip_l", "knee_l"), ("knee_l", "ankle_l"),
-    ("hip_r", "knee_r"), ("knee_r", "ankle_r"),
-    ("pelvis", "shoulder_l"), ("pelvis", "shoulder_r"),
-    ("shoulder_l", "elbow_l"), ("elbow_l", "wrist_l"),
-    ("shoulder_r", "elbow_r"), ("elbow_r", "wrist_r"),
-]
+    if fig is None or not figure_is_alive(fig):
+        return
+    try:
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+    except Exception:
+        pass
 
 
-def _deg(rad: float) -> float:
-    return float(np.degrees(rad))
+def pump_matplotlib_events(figs: Optional[list] = None) -> None:
+    """刷新 matplotlib 窗口事件（仅 flush_events，不用 plt.pause）。
+
+    plt.pause 会在拖动 3D 窗口时嵌套跑 Tk 事件循环并释放 GIL，
+    随后 cv2.waitKey 触发 PyEval_RestoreThread 崩溃。
+    实际重绘由 present_figure() 在 update 时完成。
+    """
+    import matplotlib
+    backend = matplotlib.get_backend().lower()
+    if backend == "agg" or backend.endswith("agg"):
+        return
+    if not figs:
+        return
+    for fig in figs:
+        if fig is None or not figure_is_alive(fig):
+            continue
+        try:
+            fig.canvas.flush_events()
+        except Exception:
+            pass
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     if n < 1e-8:
-        return np.zeros(3)
+        return np.zeros(3, dtype=np.float64)
     return v / n
 
 
 def _kps_array(keypoints: list[dict]) -> dict[int, np.ndarray]:
-    return {kp["id"]: np.array([kp["x"], kp["y"], kp["z"]], dtype=np.float64)
-            for kp in keypoints}
+    return {
+        kp["id"]: np.array([kp["x"], kp["y"], kp["z"]], dtype=np.float64)
+        for kp in keypoints
+    }
 
 
-def _rotation_x(a: float) -> np.ndarray:
-    c, s = math.cos(a), math.sin(a)
-    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+def _kp_confidence(keypoints: list[dict]) -> dict[int, float]:
+    return {kp["id"]: float(kp.get("confidence", 0.0)) for kp in keypoints}
 
 
-def _rotation_y(a: float) -> np.ndarray:
-    c, s = math.cos(a), math.sin(a)
-    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+def _point_valid(
+    pts: dict[int, np.ndarray],
+    idx: int,
+    conf: Optional[dict[int, float]] = None,
+    *,
+    min_conf: float = 0.01,
+) -> bool:
+    if idx not in pts:
+        return False
+    p = pts[idx]
+    if not np.all(np.isfinite(p)) or np.linalg.norm(p) < 1e-5:
+        return False
+    if conf is not None and conf.get(idx, 0.0) < min_conf:
+        return False
+    return True
 
 
-def _rotation_z(a: float) -> np.ndarray:
-    c, s = math.cos(a), math.sin(a)
-    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+def _hand_landmark_ids(side: str) -> tuple[int, int, int]:
+    """食指、拇指、小指（MediaPipe 顺序）。"""
+    if side == "l":
+        return MP["LI"], MP["LT"], MP["LP"]
+    return MP["RI"], MP["RT"], MP["RP"]
 
 
-def _euler_xyz(R: np.ndarray) -> tuple[float, float, float]:
-    """旋转矩阵 → XYZ 欧拉角（弧度）。"""
-    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    if sy > 1e-6:
-        ax = math.atan2(R[2, 1], R[2, 2])
-        ay = math.atan2(-R[2, 0], sy)
-        az = math.atan2(R[1, 0], R[0, 0])
-    else:
-        ax = math.atan2(-R[1, 2], R[1, 1])
-        ay = math.atan2(-R[2, 0], sy)
-        az = 0.0
-    return ax, ay, az
+def _foot_landmark_ids(side: str) -> tuple[int, int]:
+    if side == "l":
+        return MP["LFI"], MP["LHE"]
+    return MP["RFI"], MP["RHE"]
 
 
-def _build_body_frame(pts: dict[int, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """骨盆局部坐标系：+X 右，+Y 上，+Z 脸。"""
+def _hand_distal(pts: dict[int, np.ndarray], side: str, conf: dict[int, float]) -> Optional[np.ndarray]:
+    """掌段远端：优先食指，其次拇指/小指，或可用点均值。"""
+    avail = [
+        pts[idx] for idx in _hand_landmark_ids(side)
+        if _point_valid(pts, idx, conf)
+    ]
+    if not avail:
+        return None
+    if _point_valid(pts, _hand_landmark_ids(side)[0], conf):
+        return pts[_hand_landmark_ids(side)[0]]
+    return np.mean(avail, axis=0)
+
+
+def _hand_rotation(
+    wrist: np.ndarray,
+    R_fore: np.ndarray,
+    pts: dict[int, np.ndarray],
+    side: str,
+    conf: dict[int, float],
+) -> np.ndarray:
+    distal = _hand_distal(pts, side, conf)
+    if distal is None:
+        return R_fore
+    twist_ref = R_fore[:, 2]
+    return _segment_rotation(wrist, distal, twist_ref)
+
+
+def _foot_rotation(
+    ankle: np.ndarray,
+    pts: dict[int, np.ndarray],
+    side: str,
+    conf: dict[int, float],
+    twist_ref: np.ndarray,
+    knee: np.ndarray,
+    R_pelvis: np.ndarray,
+) -> np.ndarray:
+    """足段世界姿态。无可靠脚尖时相对小腿无旋转（角度≈0），FK 可视化再补默认脚板。"""
+    R_shank = _segment_rotation(knee, ankle, twist_ref)
+    toe_id, heel_id = _foot_landmark_ids(side)
+    shank_axis = R_shank[:, 1]
+    if _point_valid(pts, toe_id, conf, min_conf=DISTAL_MIN_CONF):
+        toe = pts[toe_id]
+        toe_vec = toe - ankle
+        if np.linalg.norm(toe_vec) > 1e-5:
+            toe_dir = _normalize(toe_vec)
+            if abs(float(np.dot(toe_dir, shank_axis))) < FOOT_SHANK_PARALLEL_COS:
+                foot_twist = twist_ref
+                if _point_valid(pts, heel_id, conf, min_conf=DISTAL_MIN_CONF):
+                    heel_vec = pts[heel_id] - ankle
+                    if np.linalg.norm(heel_vec) > 1e-5:
+                        foot_twist = heel_vec
+                return _segment_rotation(ankle, toe, foot_twist)
+    return R_shank
+
+
+def _global_axes_in_unity() -> np.ndarray:
+    """绝对坐标系 → Unity 坐标（+X 右，+Y 上，+Z 脸），右手系 det=+1。
+
+    description.json：X=前后，Y=垂直，Z=左右。
+    e_z = e_x × e_y → Unity 中 global Z 对应 -X。
+    """
+    ex = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    ey = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    ez = np.cross(ex, ey)
+    return np.column_stack([ex, ey, ez])
+
+
+def _build_pelvis_frame(pts: dict[int, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """骨盆段旋转矩阵（列向量为 x/y/z 轴，Unity 世界系）。"""
     lh, rh = pts[MP["LH"]], pts[MP["RH"]]
     ls, rs = pts[MP["LS"]], pts[MP["RS"]]
     origin = 0.5 * (lh + rh)
@@ -123,306 +252,227 @@ def _build_body_frame(pts: dict[int, np.ndarray]) -> tuple[np.ndarray, np.ndarra
     mid_shoulder = 0.5 * (ls + rs)
     y_hint = _normalize(mid_shoulder - origin)
     z_axis = _normalize(np.cross(x_axis, y_hint))
-    y_axis = np.cross(z_axis, x_axis)
-    y_axis = _normalize(y_axis)
-    R = np.column_stack([x_axis, y_axis, z_axis])
-    return origin, R
+    y_axis = _normalize(np.cross(z_axis, x_axis))
+    return origin, np.column_stack([x_axis, y_axis, z_axis])
 
 
-def _angle_between(a: np.ndarray, b: np.ndarray) -> float:
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na < 1e-8 or nb < 1e-8:
-        return 0.0
-    cos_v = np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0)
-    return _deg(math.acos(cos_v))
-
-
-def _flexion_angle(parent: np.ndarray, joint: np.ndarray, child: np.ndarray) -> float:
-    """关节屈曲角（度）：伸直=0，弯曲为正值。"""
-    proximal = _normalize(parent - joint)
-    distal = _normalize(child - joint)
-    return max(0.0, 180.0 - _angle_between(proximal, distal))
-
-
-def _extension_angle(parent: np.ndarray, joint: np.ndarray, child: np.ndarray) -> float:
-    """关节伸展角（度）：伸直=0，屈曲为负值。"""
-    proximal = _normalize(parent - joint)
-    distal = _normalize(child - joint)
-    return _angle_between(proximal, distal) - 180.0
-
-
-_BONE_REST = np.array([0.0, -1.0, 0.0], dtype=np.float64)
-
-
-def _spherical_dir(theta: float, phi: float) -> np.ndarray:
-    return np.array([
-        math.sin(theta) * math.cos(phi),
-        math.cos(theta),
-        math.sin(theta) * math.sin(phi),
-    ], dtype=np.float64)
-
-
-def _rotate_vector(v: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
-    axis = _normalize(axis)
-    c, s = math.cos(angle_rad), math.sin(angle_rad)
-    return _normalize(v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1.0 - c))
-
-
-def _hip_angles_from_local(d: np.ndarray, side: str) -> tuple[float, float, float]:
-    if side == "r":
-        ax = _deg(math.atan2(d[2], d[1]))
-        ay = _deg(math.atan2(-d[0], math.hypot(d[1], d[2])))
-        az = _deg(math.atan2(d[0], d[1]))
-    else:
-        ax = _deg(math.atan2(d[2], d[1]))
-        ay = _deg(math.atan2(d[0], math.hypot(d[1], d[2])))
-        az = _deg(math.atan2(-d[0], d[1]))
-    return ax, ay, az
-
-
-def _arm_angles_from_local(d: np.ndarray, side: str) -> tuple[float, float, float]:
-    if side == "r":
-        ax = _deg(math.atan2(-d[0], d[1]))
-        ay = _deg(math.atan2(d[0], d[2]))
-        az = _deg(math.atan2(d[2], d[1]))
-    else:
-        ax = _deg(math.atan2(d[0], d[1]))
-        ay = _deg(math.atan2(-d[0], d[2]))
-        az = _deg(math.atan2(d[2], d[1]))
-    return ax, ay, az
-
-
-def _solve_unit_dir_from_angles(
-    predict_fn,
-    ax: float,
-    ay: float,
-    az: float,
-    side: str,
+def _segment_rotation(
+    proximal: np.ndarray,
+    distal: np.ndarray,
+    twist_ref: np.ndarray,
 ) -> np.ndarray:
-    """在球面上搜索与给定关节角最一致的单位方向。"""
-    best_dir = _BONE_REST.copy()
-    best_loss = 1e18
-    for ti in range(37):
-        theta = ti * math.pi / 36.0
-        for pi in range(73):
-            phi = pi * 2.0 * math.pi / 72.0
-            d = _spherical_dir(theta, phi)
-            pa, pb, pc = predict_fn(d, side)
-            loss = (pa - ax) ** 2 + (pb - ay) ** 2 + (pc - az) ** 2
-            if loss < best_loss:
-                best_loss = loss
-                best_dir = d
-    return _normalize(best_dir)
+    """由两点 + 参考向量构造段姿态（锁 twist：y 沿骨轴，z 为 twist_ref 在法平面投影）。"""
+    y = _normalize(distal - proximal)
+    if np.linalg.norm(y) < 1e-8:
+        return np.eye(3, dtype=np.float64)
 
-
-def _hip_dir_local(ax: float, ay: float, az: float, side: str) -> np.ndarray:
-    return _solve_unit_dir_from_angles(_hip_angles_from_local, ax, ay, az, side)
-
-
-def _arm_dir_local(ax: float, ay: float, az: float, side: str) -> np.ndarray:
-    return _solve_unit_dir_from_angles(_arm_angles_from_local, ax, ay, az, side)
-
-
-def _elbow_frame(upper_dir: np.ndarray, R_body: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """肘/膝处局部坐标：y=近端骨，x=屈伸轴，z=完成右手系。"""
-    y = _normalize(upper_dir)
-    z = R_body[:, 2] - np.dot(R_body[:, 2], y) * y
+    z = twist_ref - np.dot(twist_ref, y) * y
     if np.linalg.norm(z) < 1e-6:
-        z = R_body[:, 0] - np.dot(R_body[:, 0], y) * y
+        alt = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(float(y[2])) > 0.9:
+            alt = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        z = alt - np.dot(alt, y) * y
     z = _normalize(z)
-    x = _normalize(np.cross(y, z))
-    return x, y, z
+    x = np.cross(y, z)
+    return np.column_stack([x, y, z])
 
 
-def _elbow_forearm_dir(
-    upper_dir: np.ndarray,
-    R_body: np.ndarray,
-    flex_deg: float,
-    ay_deg: float,
-    side: str,
+def _relative_rotation(parent: np.ndarray, child: np.ndarray) -> np.ndarray:
+    return parent.T @ child
+
+
+def _safe_rotation(R: np.ndarray) -> np.ndarray:
+    """SVD 投影到最近的合法旋转矩阵（det=+1）。"""
+    u, _, vt = np.linalg.svd(R)
+    r = u @ vt
+    if np.linalg.det(r) < 0.0:
+        u[:, -1] *= -1.0
+        r = u @ vt
+    return r
+
+
+def _euler(seq: str, R: np.ndarray) -> tuple[float, float, float]:
+    from scipy.spatial.transform import Rotation as SciR
+    return tuple(float(v) for v in SciR.from_matrix(_safe_rotation(R)).as_euler(seq, degrees=False))
+
+
+def _from_euler(seq: str, angles: tuple[float, float, float]) -> np.ndarray:
+    from scipy.spatial.transform import Rotation as SciR
+    return SciR.from_euler(seq, angles, degrees=False).as_matrix()
+
+
+def _decode_zxy_limb(
+    ax: float, ay: float, az: float, side: str,
+) -> tuple[float, float, float]:
+    """髋/膝：localaxes ZXY 编码的逆映射。"""
+    if side == "l":
+        return ax, az, -ay
+    return ax, -az, ay
+
+
+def _encode_zxy_limb(
+    rot_z: float, rot_x: float, rot_y: float, side: str,
+) -> tuple[float, float, float]:
+    """髋/膝：ZXY 欧拉 → description 字段。"""
+    if side == "l":
+        return rot_z, -rot_y, rot_x
+    return rot_z, rot_y, -rot_x
+
+
+def _encode_zxy_ankle(
+    rot_z: float, rot_x: float, _rot_y: float, side: str,
+) -> tuple[float, float, float]:
+    if side == "l":
+        return rot_z, 0.0, rot_x
+    return rot_z, 0.0, -rot_x
+
+
+def _decode_zxy_ankle(ax: float, _ay: float, az: float, side: str) -> tuple[float, float, float]:
+    if side == "l":
+        return ax, az, 0.0
+    return ax, -az, 0.0
+
+
+def _encode_yxz_arm(
+    rot_y: float, rot_x: float, rot_z: float, side: str,
+) -> tuple[float, float, float]:
+    """肩：localaxes YXZ；AY 为第二角（锁 twist 时通常≈0）。"""
+    if side == "l":
+        return rot_z, -rot_x, rot_y
+    return rot_z, rot_x, rot_y
+
+
+def _decode_yxz_arm(ax: float, ay: float, az: float, side: str) -> tuple[float, float, float]:
+    if side == "l":
+        return az, -ay, ax
+    return az, ay, ax
+
+
+def _encode_zxy_elbow(
+    rot_z: float, rot_x: float, rot_y: float, side: str,
+) -> tuple[float, float, float]:
+    """肘：localaxes ZXY；AZ 为第三角（应≈0），AX/AY 为屈伸/旋转。"""
+    if side == "l":
+        return rot_z, -rot_x, rot_y
+    return -rot_z, rot_x, rot_y
+
+
+def _decode_zxy_elbow(ax: float, ay: float, az: float, side: str) -> tuple[float, float, float]:
+    if side == "l":
+        return ax, -ay, az
+    return -ax, ay, az
+
+
+def _default_foot_rotation(
+    ankle: np.ndarray,
+    knee: np.ndarray,
+    R_pelvis: np.ndarray,
 ) -> np.ndarray:
-    """由肘角重建前臂方向（与 _elbow_angles 互逆）。"""
-    x_axis, y_axis, _z_axis = _elbow_frame(upper_dir, R_body)
-    fore = _rotate_vector(y_axis, x_axis, math.radians(flex_deg))
-    best_dir = fore
-    best_err = 1e9
-    for step in range(72):
-        twist = step * 5.0
-        candidate = _rotate_vector(fore, y_axis, math.radians(twist))
-        local = R_body.T @ candidate
-        pred = (
-            _deg(math.atan2(local[0], local[1]))
-            if side == "r"
-            else _deg(math.atan2(-local[0], local[1]))
-        )
-        err = abs((pred - ay_deg + 180.0) % 360.0 - 180.0)
-        if err < best_err:
-            best_err = err
-            best_dir = candidate
-    return _normalize(best_dir)
+    """无可靠脚尖时：脚板水平指向前方（+Z），与小腿近似 90°。"""
+    shank = _normalize(ankle - knee)
+    forward = R_pelvis[:, 2]
+    foot_dir = forward - np.dot(forward, shank) * shank
+    if np.linalg.norm(foot_dir) < 1e-6:
+        lateral = R_pelvis[:, 0]
+        foot_dir = lateral - np.dot(lateral, shank) * shank
+    foot_dir = _normalize(foot_dir)
+    up = R_pelvis[:, 1]
+    return _segment_rotation(ankle, ankle + foot_dir, up)
 
 
-def _knee_shank_dir(
-    thigh_dir: np.ndarray,
-    R_body: np.ndarray,
-    ext_deg: float,
-    ay_deg: float,
-    az_deg: float,
-    side: str,
+def _approx_foot_rotation(
+    knee: np.ndarray,
+    ankle: np.ndarray,
+    R_pelvis: np.ndarray,
 ) -> np.ndarray:
-    """由膝角重建小腿方向。
+    return _default_foot_rotation(ankle, knee, R_pelvis)
 
-    膝为铰链关节，主要自由度是伸/屈角 (ext_deg)。
-    - 去掉 az_deg 预旋转：az 由 atan2(x,z) 求得，小腿近竖直时极不稳定，
-      直接作用会在不同帧产生任意扭曲。
-    - 近伸直时 (|ext_deg|<12°) ay 也无法稳定定义（atan2 分子接近 0），
-      直接返回纯伸直方向，不做旋转搜索。
-    """
-    x_axis, y_axis, _z_axis = _elbow_frame(thigh_dir, R_body)
-    shank = _rotate_vector(y_axis, x_axis, math.radians(-ext_deg))
 
-    if abs(ext_deg) < 12.0:
-        return _normalize(shank)
+def _pelvis_angles(R_pelvis: np.ndarray) -> tuple[float, float, float]:
+    """骨盆相对绝对坐标系，XZY 顺序（同 localaxes_to_jointangles）。"""
+    G = _global_axes_in_unity()
+    R_rel = _relative_rotation(G, R_pelvis)
+    az, ax, ay = _euler("XZY", R_rel)
+    return ax, ay, az
 
-    best_dir = shank
-    best_err = 1e9
-    for step in range(72):
-        twist = step * 5.0
-        candidate = _rotate_vector(shank, y_axis, math.radians(twist))
-        local = R_body.T @ candidate
-        pred = (
-            _deg(math.atan2(-local[0], local[1]))
-            if side == "r"
-            else _deg(math.atan2(local[0], local[1]))
-        )
-        err = abs((pred - ay_deg + 180.0) % 360.0 - 180.0)
-        if err < best_err:
-            best_err = err
-            best_dir = candidate
-    return _normalize(best_dir)
+
+def _pelvis_rotation(ax: float, ay: float, az: float) -> np.ndarray:
+    G = _global_axes_in_unity()
+    R_rel = _from_euler("XZY", (az, ax, ay))
+    return G @ R_rel
 
 
 class JointAngleCalculator:
-    """从 Unity 关键点计算图中定义的关节角（度）。"""
-
-    def _build_body_frame(self, pts: dict[int, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-        return _build_body_frame(pts)
-
-    def _local_dir(self, R: np.ndarray, origin: np.ndarray, target: np.ndarray) -> np.ndarray:
-        return _normalize(R.T @ (target - origin))
-
-    def _hip_angles(self, R: np.ndarray, hip: np.ndarray, knee: np.ndarray, side: str) -> tuple[float, float, float]:
-        d = self._local_dir(R, hip, knee)
-        if side == "r":
-            # AX +前 -后, AY +内 -外, AZ +内旋 -外旋
-            ax = _deg(math.atan2(d[2], d[1]))
-            ay = _deg(math.atan2(-d[0], math.hypot(d[1], d[2])))
-            az = _deg(math.atan2(d[0], d[1]))
-        else:
-            ax = _deg(math.atan2(d[2], d[1]))
-            ay = _deg(math.atan2(d[0], math.hypot(d[1], d[2])))
-            az = _deg(math.atan2(-d[0], d[1]))
-        return ax, ay, az
-
-    def _knee_angles(
-        self, R: np.ndarray, hip: np.ndarray, knee: np.ndarray, ankle: np.ndarray, side: str
-    ) -> tuple[float, float, float]:
-        ax = _extension_angle(hip, knee, ankle)  # +伸 -屈，直腿=0
-        shank_local = self._local_dir(R, knee, ankle)
-        ay = _deg(math.atan2(-shank_local[0], shank_local[1])) if side == "r" else _deg(
-            math.atan2(shank_local[0], shank_local[1]))
-        # 站立时小腿近竖直，x/z 分量很小，atan2 极不稳定，会导致 FK 膝部约 90° 抖动
-        xz = math.hypot(float(shank_local[0]), float(shank_local[2]))
-        if xz < 0.12:
-            az = 0.0
-        else:
-            az = _deg(math.atan2(shank_local[0], shank_local[2]))
-        return ax, ay, az
-
-    def _ankle_angles(
-        self, R: np.ndarray, knee: np.ndarray, ankle: np.ndarray, side: str
-    ) -> tuple[float, float]:
-        shank = _normalize(knee - ankle)
-        foot_hint = _normalize(R[:, 2])  # 朝 +Z（面部）为参考
-        ax = _angle_between(shank, foot_hint) - 90.0  # +背屈 -跖屈
-        local = self._local_dir(R, ankle, ankle + foot_hint)
-        az = _deg(math.atan2(local[0], local[2])) if side == "r" else _deg(math.atan2(-local[0], local[2]))
-        return ax, az
-
-    def _arm_angles(
-        self, R: np.ndarray, shoulder: np.ndarray, elbow: np.ndarray, side: str
-    ) -> tuple[float, float, float]:
-        d = self._local_dir(R, shoulder, elbow)
-        if side == "r":
-            ax = _deg(math.atan2(-d[0], d[1]))
-            ay = _deg(math.atan2(d[0], d[2]))
-            az = _deg(math.atan2(d[2], d[1]))
-        else:
-            ax = _deg(math.atan2(d[0], d[1]))
-            ay = _deg(math.atan2(-d[0], d[2]))
-            az = _deg(math.atan2(d[2], d[1]))
-        return ax, ay, az
-
-    def _elbow_angles(
-        self, R: np.ndarray, shoulder: np.ndarray, elbow: np.ndarray, wrist: np.ndarray, side: str
-    ) -> tuple[float, float]:
-        ax = _flexion_angle(shoulder, elbow, wrist)  # +屈肘，直臂=0
-        fore_local = self._local_dir(R, elbow, wrist)
-        ay = _deg(math.atan2(fore_local[0], fore_local[1])) if side == "r" else _deg(
-            math.atan2(-fore_local[0], fore_local[1]))
-        return ax, ay
-
-    def _wrist_angles(
-        self, R: np.ndarray, elbow: np.ndarray, wrist: np.ndarray, side: str
-    ) -> float:
-        fore = _normalize(wrist - elbow)
-        ref = _normalize(R[:, 0])
-        ax = _angle_between(fore, ref) - 90.0
-        return ax if side == "r" else -ax
+    """从 Unity 关键点计算关节角（弧度，定义见 description.json）。"""
 
     def compute(self, keypoints: list[dict]) -> dict[str, float]:
         pts = _kps_array(keypoints)
-        origin, R_body = self._build_body_frame(pts)
-        ax_p, ay_p, az_p = _euler_xyz(R_body)
+        conf = _kp_confidence(keypoints)
+        _origin, R_pelvis = _build_pelvis_frame(pts)
+        twist_ref = R_pelvis[:, 2]
         angles: dict[str, float] = {k: 0.0 for k in JOINT_ANGLE_KEYS}
 
-        angles["Pelvis_AX"] = _deg(ax_p)
-        angles["Pelvis_AY"] = _deg(ay_p)
-        angles["Pelvis_AZ"] = _deg(az_p)
+        px, py, pz = _pelvis_angles(R_pelvis)
+        angles["Pelvis_AX"] = px
+        angles["Pelvis_AY"] = py
+        angles["Pelvis_AZ"] = pz
 
-        hr_ax, hr_ay, hr_az = self._hip_angles(R_body, pts[MP["RH"]], pts[MP["RK"]], "r")
-        hl_ax, hl_ay, hl_az = self._hip_angles(R_body, pts[MP["LH"]], pts[MP["LK"]], "l")
-        angles["Hip_rAX"], angles["Hip_rAY"], angles["Hip_rAZ"] = hr_ax, hr_ay, hr_az
-        angles["Hip_lAX"], angles["Hip_lAY"], angles["Hip_lAZ"] = hl_ax, hl_ay, hl_az
+        for side, hip_id, knee_id, ankle_id, shoulder_id, elbow_id, wrist_id in (
+            ("r", MP["RH"], MP["RK"], MP["RA"], MP["RS"], MP["RE"], MP["RW"]),
+            ("l", MP["LH"], MP["LK"], MP["LA"], MP["LS"], MP["LE"], MP["LW"]),
+        ):
+            hip, knee, ankle = pts[hip_id], pts[knee_id], pts[ankle_id]
+            shoulder, elbow, wrist = pts[shoulder_id], pts[elbow_id], pts[wrist_id]
 
-        kr = self._knee_angles(R_body, pts[MP["RH"]], pts[MP["RK"]], pts[MP["RA"]], "r")
-        kl = self._knee_angles(R_body, pts[MP["LH"]], pts[MP["LK"]], pts[MP["LA"]], "l")
-        angles["Knee_rAX"], angles["Knee_rAY"], angles["Knee_rAZ"] = kr
-        angles["Knee_lAX"], angles["Knee_lAY"], angles["Knee_lAZ"] = kl
+            R_thigh = _segment_rotation(hip, knee, twist_ref)
+            R_hip = _relative_rotation(R_pelvis, R_thigh)
+            h_ax, h_ay, h_az = _encode_zxy_limb(*_euler("ZXY", R_hip), side)
+            angles[f"Hip_{side}AX"] = h_ax
+            angles[f"Hip_{side}AY"] = h_ay
+            angles[f"Hip_{side}AZ"] = h_az
 
-        ar_ax, ar_az = self._ankle_angles(R_body, pts[MP["RK"]], pts[MP["RA"]], "r")
-        al_ax, al_az = self._ankle_angles(R_body, pts[MP["LK"]], pts[MP["LA"]], "l")
-        angles["Ankle_rAX"], angles["Ankle_rAZ"] = ar_ax, ar_az
-        angles["Ankle_lAX"], angles["Ankle_lAZ"] = al_ax, al_az
+            R_shank = _segment_rotation(knee, ankle, twist_ref)
+            R_knee = _relative_rotation(R_thigh, R_shank)
+            k_ax, k_ay, k_az = _encode_zxy_limb(*_euler("ZXY", R_knee), side)
+            angles[f"Knee_{side}AX"] = k_ax
+            angles[f"Knee_{side}AY"] = k_ay
+            angles[f"Knee_{side}AZ"] = k_az
 
-        sr = self._arm_angles(R_body, pts[MP["RS"]], pts[MP["RE"]], "r")
-        sl = self._arm_angles(R_body, pts[MP["LS"]], pts[MP["LE"]], "l")
-        angles["Arm_rAX"], angles["Arm_rAY"], angles["Arm_rAZ"] = sr
-        angles["Arm_lAX"], angles["Arm_lAY"], angles["Arm_lAZ"] = sl
+            R_foot = _foot_rotation(
+                ankle, pts, side, conf, twist_ref, knee, R_pelvis,
+            )
+            R_ankle = _relative_rotation(R_shank, R_foot)
+            a_ax, a_ay, a_az = _encode_zxy_ankle(*_euler("ZXY", R_ankle), side)
+            angles[f"Ankle_{side}AX"] = a_ax
+            angles[f"Ankle_{side}AY"] = a_ay
+            angles[f"Ankle_{side}AZ"] = a_az
 
-        er = self._elbow_angles(R_body, pts[MP["RS"]], pts[MP["RE"]], pts[MP["RW"]], "r")
-        el = self._elbow_angles(R_body, pts[MP["LS"]], pts[MP["LE"]], pts[MP["LW"]], "l")
-        angles["Elbow_rAX"], angles["Elbow_rAY"] = er
-        angles["Elbow_lAX"], angles["Elbow_lAY"] = el
+            R_upper = _segment_rotation(shoulder, elbow, twist_ref)
+            R_shoulder = _relative_rotation(R_pelvis, R_upper)
+            s_ax, s_ay, s_az = _encode_yxz_arm(*_euler("YXZ", R_shoulder), side)
+            angles[f"Arm_{side}AX"] = s_ax
+            angles[f"Arm_{side}AY"] = s_ay
+            angles[f"Arm_{side}AZ"] = s_az
 
-        angles["Wrist_rAX"] = self._wrist_angles(R_body, pts[MP["RE"]], pts[MP["RW"]], "r")
-        angles["Wrist_lAX"] = self._wrist_angles(R_body, pts[MP["LE"]], pts[MP["LW"]], "l")
+            R_fore = _segment_rotation(elbow, wrist, twist_ref)
+            R_elbow = _relative_rotation(R_upper, R_fore)
+            e_ax, e_ay, e_az = _encode_zxy_elbow(*_euler("ZXY", R_elbow), side)
+            angles[f"Elbow_{side}AX"] = e_ax
+            angles[f"Elbow_{side}AY"] = e_ay
+            angles[f"Elbow_{side}AZ"] = e_az
+
+            R_hand = _hand_rotation(wrist, R_fore, pts, side, conf)
+            R_wrist = _relative_rotation(R_fore, R_hand)
+            w_ax, w_ay, w_az = _encode_zxy_ankle(*_euler("ZXY", R_wrist), side)
+            angles[f"Wrist_{side}AX"] = w_ax
+            angles[f"Wrist_{side}AY"] = w_ay
+            angles[f"Wrist_{side}AZ"] = w_az
 
         return angles
 
 
 class ForwardKinematics:
-    """由关节角正向运动学重建骨架节点（Unity 坐标）。"""
+    """由关节角正向运动学重建骨架节点（Unity 坐标，角度为弧度）。"""
 
     def __init__(self) -> None:
         self.segment_lengths: dict[str, float] = {}
@@ -430,7 +480,8 @@ class ForwardKinematics:
 
     def update_lengths(self, keypoints: list[dict]) -> None:
         pts = _kps_array(keypoints)
-        origin, R = _build_body_frame(pts)
+        conf = _kp_confidence(keypoints)
+        origin, R = _build_pelvis_frame(pts)
         for name, idx in {
             "hip_l": MP["LH"],
             "hip_r": MP["RH"],
@@ -455,16 +506,40 @@ class ForwardKinematics:
             "upper_r": (MP["RS"], MP["RE"]),
             "fore_l": (MP["LE"], MP["LW"]),
             "fore_r": (MP["RE"], MP["RW"]),
+            "hand_l": (MP["LW"], MP["LI"]),
+            "hand_r": (MP["RW"], MP["RI"]),
+            "foot_l": (MP["LA"], MP["LFI"]),
+            "foot_r": (MP["RA"], MP["RFI"]),
         }
         for name, (a, b) in pairs.items():
+            if name.startswith(("foot_", "hand_")):
+                if not (_point_valid(pts, a, conf) and _point_valid(pts, b, conf, min_conf=DISTAL_MIN_CONF)):
+                    continue
             length = float(np.linalg.norm(pts[b] - pts[a]))
             if length > 1e-4:
+                if name.startswith("foot_"):
+                    if name.endswith("_l"):
+                        shank_a, shank_b = MP["LK"], MP["LA"]
+                        shank_key = "shank_l"
+                    else:
+                        shank_a, shank_b = MP["RK"], MP["RA"]
+                        shank_key = "shank_r"
+                    shank_len = float(np.linalg.norm(pts[shank_b] - pts[shank_a]))
+                    if shank_len < 1e-4:
+                        shank_len = self.segment_lengths.get(shank_key, 0.40)
+                    # 拒绝异常长段（坏点拉到原点），保留正常足长 ~6–22 cm
+                    length = min(length, max(0.50 * shank_len, 0.10), 0.22)
+                    length = max(length, 0.06)
                 if name not in self.segment_lengths:
                     self.segment_lengths[name] = length
                 else:
-                    self.segment_lengths[name] = 0.9 * self.segment_lengths[name] + 0.1 * length
+                    self.segment_lengths[name] = (
+                        0.9 * self.segment_lengths[name] + 0.1 * length
+                    )
 
-    def _L(self, name: str, default: float = 0.25) -> float:
+    def _L(self, name: str, default: float | None = None) -> float:
+        if default is None:
+            default = DEFAULT_SEGMENT_LENGTHS.get(name, 0.25)
         return self.segment_lengths.get(name, default)
 
     def _anchor(self, name: str, default: np.ndarray) -> np.ndarray:
@@ -472,61 +547,319 @@ class ForwardKinematics:
 
     def rebuild(self, angles: dict[str, float]) -> dict[str, np.ndarray]:
         pos = np.zeros(3, dtype=np.float64)
-        R = (
-            _rotation_z(math.radians(angles["Pelvis_AZ"]))
-            @ _rotation_y(math.radians(angles["Pelvis_AY"]))
-            @ _rotation_x(math.radians(angles["Pelvis_AX"]))
+        R_pelvis = _pelvis_rotation(
+            angles["Pelvis_AX"], angles["Pelvis_AY"], angles["Pelvis_AZ"],
         )
 
         nodes: dict[str, np.ndarray] = {"pelvis": pos.copy()}
-        nodes["hip_l"] = pos + R @ self._anchor("hip_l", np.array([-0.08, 0.0, 0.0]))
-        nodes["hip_r"] = pos + R @ self._anchor("hip_r", np.array([0.08, 0.0, 0.0]))
-        nodes["shoulder_l"] = pos + R @ self._anchor(
+        nodes["hip_l"] = pos + R_pelvis @ self._anchor("hip_l", np.array([-0.08, 0.0, 0.0]))
+        nodes["hip_r"] = pos + R_pelvis @ self._anchor("hip_r", np.array([0.08, 0.0, 0.0]))
+        nodes["shoulder_l"] = pos + R_pelvis @ self._anchor(
             "shoulder_l", np.array([-0.08, 0.35, 0.0]))
-        nodes["shoulder_r"] = pos + R @ self._anchor(
+        nodes["shoulder_r"] = pos + R_pelvis @ self._anchor(
             "shoulder_r", np.array([0.08, 0.35, 0.0]))
 
         def leg_chain(parent: str, side: str, seg1: str, seg2: str, prefix: str) -> None:
             base = nodes[parent]
-            hip_local = _hip_dir_local(
-                angles[f"{prefix}AX"], angles[f"{prefix}AY"], angles[f"{prefix}AZ"], side)
-            thigh_dir = _normalize(R @ hip_local)
+            hip_e = _decode_zxy_limb(
+                angles[f"{prefix}AX"], angles[f"{prefix}AY"], angles[f"{prefix}AZ"], side,
+            )
+            R_thigh = R_pelvis @ _from_euler("ZXY", hip_e)
+            thigh_dir = R_thigh[:, 1]
             knee = base + thigh_dir * self._L(seg1)
             nodes[f"knee_{side}"] = knee
-            shank_dir = _knee_shank_dir(
-                thigh_dir, R,
+
+            knee_e = _decode_zxy_limb(
                 angles[f"Knee_{side}AX"],
                 angles[f"Knee_{side}AY"],
                 angles[f"Knee_{side}AZ"],
                 side,
             )
-            nodes[f"ankle_{side}"] = knee + shank_dir * self._L(seg2)
+            R_shank = R_thigh @ _from_euler("ZXY", knee_e)
+            ankle = knee + R_shank[:, 1] * self._L(seg2)
+            nodes[f"ankle_{side}"] = ankle
+
+            ankle_e = _decode_zxy_ankle(
+                angles[f"Ankle_{side}AX"],
+                angles[f"Ankle_{side}AY"],
+                angles[f"Ankle_{side}AZ"],
+                side,
+            )
+            R_foot = R_shank @ _from_euler("ZXY", ankle_e)
+            foot_dir = R_foot[:, 1]
+            if abs(float(np.dot(foot_dir, R_shank[:, 1]))) >= FOOT_SHANK_PARALLEL_COS:
+                R_foot = _default_foot_rotation(ankle, knee, R_pelvis)
+            nodes[f"foot_{side}"] = ankle + R_foot[:, 1] * self._L(f"foot_{side}")
 
         leg_chain("hip_l", "l", "thigh_l", "shank_l", "Hip_l")
         leg_chain("hip_r", "r", "thigh_r", "shank_r", "Hip_r")
 
         def arm_chain(side: str) -> None:
             shoulder = nodes[f"shoulder_{side}"]
-            arm_local = _arm_dir_local(
+            arm_e = _decode_yxz_arm(
                 angles[f"Arm_{side}AX"],
                 angles[f"Arm_{side}AY"],
                 angles[f"Arm_{side}AZ"],
                 side,
             )
-            upper_dir = _normalize(R @ arm_local)
-            elbow = shoulder + upper_dir * self._L(f"upper_{side}")
+            R_upper = R_pelvis @ _from_euler("YXZ", arm_e)
+            elbow = shoulder + R_upper[:, 1] * self._L(f"upper_{side}")
             nodes[f"elbow_{side}"] = elbow
-            fore_dir = _elbow_forearm_dir(
-                upper_dir, R,
+
+            elbow_e = _decode_zxy_elbow(
                 angles[f"Elbow_{side}AX"],
                 angles[f"Elbow_{side}AY"],
+                angles[f"Elbow_{side}AZ"],
                 side,
             )
-            nodes[f"wrist_{side}"] = elbow + fore_dir * self._L(f"fore_{side}")
+            R_fore = R_upper @ _from_euler("ZXY", elbow_e)
+            wrist = elbow + R_fore[:, 1] * self._L(f"fore_{side}")
+            nodes[f"wrist_{side}"] = wrist
+
+            wrist_e = _decode_zxy_ankle(
+                angles[f"Wrist_{side}AX"],
+                angles[f"Wrist_{side}AY"],
+                angles[f"Wrist_{side}AZ"],
+                side,
+            )
+            R_hand = R_fore @ _from_euler("ZXY", wrist_e)
+            nodes[f"hand_{side}"] = wrist + R_hand[:, 1] * self._L(f"hand_{side}")
 
         arm_chain("l")
         arm_chain("r")
         return nodes
+
+
+def _connection_indices(conn) -> tuple[int, int]:
+    if hasattr(conn, "start"):
+        return int(conn.start), int(conn.end)
+    return int(conn[0]), int(conn[1])
+
+
+def _set_axonometric_view(ax, elev: float = AXONOMETRIC_ELEV, azim: float = AXONOMETRIC_AZIM) -> None:
+    ax.view_init(elev=elev, azim=azim)
+
+
+def _style_pose_axis(
+    ax,
+    title: str,
+    *,
+    elev: float = AXONOMETRIC_ELEV,
+    azim: float = AXONOMETRIC_AZIM,
+) -> None:
+    ax.set_xlabel("X (m, right)")
+    ax.set_ylabel("Z (m, +Z → face)")
+    ax.set_zlabel("Y (m, +Y → head)")
+    ax.set_title(title)
+    _set_axonometric_view(ax, elev, azim)
+
+
+def _fit_axis_limits(
+    ax,
+    plot_pts: list[tuple[float, float, float]],
+    *,
+    zoom: float = 1.0,
+) -> None:
+    if not plot_pts:
+        return
+    xs = [p[0] for p in plot_pts]
+    ys = [p[1] for p in plot_pts]
+    zs = [p[2] for p in plot_pts]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    cz = sum(zs) / len(zs)
+    span = max(
+        max(abs(v - c) for v in coords)
+        for coords, c in ((xs, cx), (ys, cy), (zs, cz))
+    )
+    half = max(0.5, span * 1.3) / max(zoom, 0.1)
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_zlim(cz - half, cz + half)
+    ax.set_box_aspect([1, 1, 1])
+
+
+class CombinedPose3DVisualizer:
+    """左：原始关键点；右：关节角 FK 重建。Agg 离屏渲染后由 OpenCV 显示。"""
+
+    def __init__(
+        self,
+        raw_connections,
+        *,
+        raw_kp_valid=None,
+        raw_to_plot=None,
+        fk_to_plot=None,
+        fk_connections=None,
+        raw_title: str = "Raw Keypoints",
+        fk_title: str = "FK Reconstructed",
+        window_title: str = "3D Pose Comparison",
+        cv_window: Optional[str] = None,
+    ) -> None:
+        self._closed = False
+        self._cv_window = cv_window or window_title
+        self.raw_connections = raw_connections
+        self.fk_connections = fk_connections or FK_CONNECTIONS
+        self.raw_kp_valid = raw_kp_valid or (
+            lambda kp: kp.get("confidence", 0) > 0
+            and (kp["x"] != 0 or kp["y"] != 0 or kp["z"] != 0)
+        )
+        self.raw_to_plot = raw_to_plot or (
+            lambda kp: (float(kp["x"]), float(kp["z"]), float(kp["y"]))
+        )
+        self.fk_to_plot = fk_to_plot or (
+            lambda p: (float(p[0]), float(p[2]), float(p[1]))
+        )
+        self.raw_title = raw_title
+        self.fk_title = fk_title
+        self._elev = AXONOMETRIC_ELEV
+        self._azim = AXONOMETRIC_AZIM
+        self._zoom = 1.0
+        self._dragging = False
+        self._last_mouse: Optional[tuple[int, int]] = None
+        self._cached_raw: Optional[list[dict]] = None
+        self._cached_raw_suffix = ""
+        self._cached_fk: Optional[dict[str, np.ndarray]] = None
+
+        self._fig = Figure(figsize=(14, 7), dpi=100)
+        self._canvas = FigureCanvasAgg(self._fig)
+        self.ax_raw = self._fig.add_subplot(1, 2, 1, projection="3d")
+        self.ax_fk = self._fig.add_subplot(1, 2, 2, projection="3d")
+        self._fig.subplots_adjust(left=0.02, right=0.98, wspace=0.08)
+        self._style_axis(self.ax_raw, self.raw_title)
+        self._style_axis(self.ax_fk, self.fk_title)
+        _fit_axis_limits(self.ax_raw, [(0.0, 0.0, 0.0)], zoom=self._zoom)
+        _fit_axis_limits(self.ax_fk, [(0.0, 0.0, 0.0)], zoom=self._zoom)
+
+        cv2.namedWindow(self._cv_window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self._cv_window, 1400, 700)
+        cv2.setMouseCallback(self._cv_window, self._on_mouse)
+        self._present()
+
+    @property
+    def fig(self):
+        return self._fig
+
+    def _style_axis(self, ax, title: str) -> None:
+        _style_pose_axis(ax, title, elev=self._elev, azim=self._azim)
+
+    def _on_mouse(self, event: int, x: int, y: int, flags: int, _param) -> None:
+        if self._closed:
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._dragging = True
+            self._last_mouse = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._dragging = False
+            self._last_mouse = None
+        elif event == cv2.EVENT_MOUSEMOVE and self._dragging and self._last_mouse:
+            dx = x - self._last_mouse[0]
+            dy = y - self._last_mouse[1]
+            self._azim = (self._azim + dx * 0.4) % 360.0
+            self._elev = float(np.clip(self._elev - dy * 0.4, -89.0, 89.0))
+            self._last_mouse = (x, y)
+            self._redraw()
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            delta = cv2.getMouseWheelDelta(flags) if hasattr(cv2, "getMouseWheelDelta") else flags
+            if delta > 0:
+                self._zoom = min(4.0, self._zoom * 1.08)
+            elif delta < 0:
+                self._zoom = max(0.25, self._zoom / 1.08)
+            self._redraw()
+        elif event == cv2.EVENT_LBUTTONDBLCLK:
+            self._elev = AXONOMETRIC_ELEV
+            self._azim = AXONOMETRIC_AZIM
+            self._zoom = 1.0
+            self._redraw()
+
+    def _present(self) -> None:
+        if self._closed:
+            return
+        self._canvas.draw()
+        rgba = np.asarray(self._canvas.buffer_rgba())
+        bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+        cv2.imshow(self._cv_window, bgr)
+
+    def _draw_raw(self, ax, keypoints: list[dict], title_suffix: str = "") -> None:
+        ax.clear()
+        title = self.raw_title + (f" {title_suffix}" if title_suffix else "")
+        self._style_axis(ax, title)
+
+        valid = {kp["id"]: kp for kp in keypoints if self.raw_kp_valid(kp)}
+        if not valid:
+            return
+
+        plot_pts = [self.raw_to_plot(kp) for kp in valid.values()]
+        ax.scatter(
+            [p[0] for p in plot_pts], [p[1] for p in plot_pts], [p[2] for p in plot_pts],
+            c="darkorange", s=36, depthshade=True,
+        )
+        for conn in self.raw_connections:
+            i, j = _connection_indices(conn)
+            if i in valid and j in valid:
+                p1 = self.raw_to_plot(valid[i])
+                p2 = self.raw_to_plot(valid[j])
+                ax.plot(
+                    [p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                    color="royalblue", linewidth=2,
+                )
+
+        _fit_axis_limits(ax, plot_pts, zoom=self._zoom)
+
+    def _draw_fk(self, ax, nodes: dict[str, np.ndarray]) -> None:
+        ax.clear()
+        self._style_axis(ax, self.fk_title)
+
+        if not nodes:
+            return
+
+        plot_pts = [self.fk_to_plot(p) for p in nodes.values()]
+        ax.scatter(
+            [p[0] for p in plot_pts], [p[1] for p in plot_pts], [p[2] for p in plot_pts],
+            c="mediumseagreen", s=36, depthshade=True,
+        )
+        for a, b in self.fk_connections:
+            if a in nodes and b in nodes:
+                p1 = self.fk_to_plot(nodes[a])
+                p2 = self.fk_to_plot(nodes[b])
+                ax.plot(
+                    [p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                    color="royalblue", linewidth=2,
+                )
+
+        _fit_axis_limits(ax, plot_pts, zoom=self._zoom)
+
+    def _redraw(self) -> None:
+        if self._cached_raw is not None:
+            self._draw_raw(self.ax_raw, self._cached_raw, self._cached_raw_suffix)
+        if self._cached_fk is not None:
+            self._draw_fk(self.ax_fk, self._cached_fk)
+        self._present()
+
+    def update(
+        self,
+        raw_keypoints: Optional[list[dict]] = None,
+        fk_nodes: Optional[dict[str, np.ndarray]] = None,
+        raw_title_suffix: str = "",
+    ) -> None:
+        if self._closed:
+            return
+        if raw_keypoints is not None:
+            self._cached_raw = raw_keypoints
+            self._cached_raw_suffix = raw_title_suffix
+        if fk_nodes is not None:
+            self._cached_fk = fk_nodes
+        self._redraw()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            cv2.setMouseCallback(self._cv_window, lambda *_args: None)
+            cv2.destroyWindow(self._cv_window)
+        except cv2.error:
+            pass
+        self._fig.clf()
 
 
 class ReconstructedPoseVisualizer:
@@ -538,7 +871,7 @@ class ReconstructedPoseVisualizer:
         self._closed = False
         self.fig = plt.figure("3D Pose (Joint Angles FK)", figsize=(8, 8))
         self.ax = self.fig.add_subplot(111, projection="3d")
-        self.ax.view_init(elev=10, azim=-90)
+        _set_axonometric_view(self.ax)
         self.fig.canvas.mpl_connect(
             "close_event", lambda _evt: setattr(self, "_closed", True))
 
@@ -557,7 +890,7 @@ class ReconstructedPoseVisualizer:
         self.ax.set_title(f"FK Reconstructed ({len(nodes)} nodes)")
 
         if not nodes:
-            self.fig.canvas.draw_idle()
+            present_figure(self.fig)
             return
 
         pts = list(nodes.values())
@@ -587,8 +920,7 @@ class ReconstructedPoseVisualizer:
         self.ax.set_ylim(cz - half, cz + half)
         self.ax.set_zlim(cy - half, cy + half)
         self.ax.set_box_aspect([1, 1, 1])
-        self.ax.invert_zaxis()
-        self.fig.canvas.draw_idle()
+        present_figure(self.fig)
 
     def close(self) -> None:
         plt = _plt()

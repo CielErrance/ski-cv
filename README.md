@@ -56,7 +56,9 @@ python realsense_yolo.py
 | `zed_bodytracking.py` | ZED 2i + Body Tracking 关节角采集 |
 | `zed_skeleton.py` | ZED BODY_34 → MediaPipe 索引 / Unity 坐标适配 |
 | `realsense_yolo.py` | RealSense + YOLO 姿态 + 骨长约束 |
-| `joint_angles.py` | 关节角计算与正运动学可视化 |
+| `joint_angles.py` | 关节角计算（弧度，定义见 `description.json`）与正运动学可视化 |
+| `description.json` | 各关节角字段含义与正负号约定 |
+| `validate_joint_angles.py` | 合成姿态 FK 重建误差检验（需 `conda activate ski`） |
 | `yolo11n-pose.pt` | YOLO 预训练权重 |
 
 ## 发布到 GitHub

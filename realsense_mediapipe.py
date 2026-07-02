@@ -1,8 +1,11 @@
 import multiprocessing as mp_ctx
 import os
 
-# 采集子进程不初始化 TkAgg，避免与主进程 OpenCV/matplotlib GUI 争用 GIL
-if mp_ctx.current_process().name != "MainProcess":
+# 主进程固定 TkAgg；子进程用 Agg，避免与 OpenCV GUI 争用 GIL
+if mp_ctx.current_process().name == "MainProcess":
+    import matplotlib
+    matplotlib.use("TkAgg", force=True)
+else:
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 import cv2
@@ -33,12 +36,12 @@ from typing import Optional, TextIO
 from urllib.request import urlretrieve
 
 from joint_angles import (
+    CombinedPose3DVisualizer,
     ForwardKinematics,
     JointAngleCalculator,
-    ReconstructedPoseVisualizer,
     _plt,
+    _set_axonometric_view,
     figure_is_alive,
-    pump_matplotlib_events,
 )
 
 POSE_MODEL_URL = (
@@ -82,6 +85,7 @@ ONE_EURO_D_CUTOFF = 1.0
 KEYPOINT_CONF_THRESHOLD = 0.0
 
 CV_WINDOW_NAME = "Motion Capture (Local Debug)"
+CV_DISPLAY_WIDTH = 960
 RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
 
 # # TCP 客户端连接配置
@@ -283,7 +287,7 @@ class Pose3DVisualizer:
         self.connections = connections
         self.fig = plt.figure("3D Pose (Unity Space)", figsize=(8, 8))
         self.ax = self.fig.add_subplot(111, projection="3d")
-        self.ax.view_init(elev=10, azim=-90)
+        _set_axonometric_view(self.ax)
         self.fig.canvas.mpl_connect(
             "close_event", lambda _evt: setattr(self, "_closed", True))
 
@@ -345,7 +349,6 @@ class Pose3DVisualizer:
             self.ax.set_ylim(center_z - half, center_z + half)
             self.ax.set_zlim(center_y - half, center_y + half)
             self.ax.set_box_aspect([1, 1, 1])
-            self.ax.invert_zaxis()
 
         self.fig.canvas.draw_idle()
 
@@ -464,10 +467,13 @@ class PoseCaptureWorker:
 
     @staticmethod
     def _world_to_unity(relative_world: np.ndarray, scale: float) -> np.ndarray:
-        """MediaPipe world → Unity 坐标（髋为原点，+Y 头，-Y 脚，+Z 脸）。"""
+        """MediaPipe world → Unity 坐标（髋为原点，+Y 头，-Y 脚，+Z 脸）。
+
+        MediaPipe pose_world_landmarks：+X 右，+Y 下，+Z 朝向相机。
+        """
         return np.array([
             relative_world[0] * scale,
-            relative_world[1] * scale,
+            -relative_world[1] * scale,
             relative_world[2] * scale,
         ], dtype=np.float64)
 
@@ -805,26 +811,46 @@ class MotionCaptureApp:
         self.stop_event = stop_event
         self.capture_process = capture_process
         self.pose_connections = PoseLandmarksConnections.POSE_LANDMARKS
-        self.visualizer: Optional[Pose3DVisualizer] = None
-        self.fk_visualizer: Optional[ReconstructedPoseVisualizer] = None
+        self.visualizer: Optional[CombinedPose3DVisualizer] = None
         self.forward_kinematics = ForwardKinematics()
         self.start_time = time.time()
         self.frame_count = 0
         self.recorder = BroadcastRecorder()
         self._record_btn_rect: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._display_scale = 1.0
+
+    def _prepare_display(self, image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        if w <= CV_DISPLAY_WIDTH:
+            self._display_scale = 1.0
+            return image
+        self._display_scale = CV_DISPLAY_WIDTH / w
+        return cv2.resize(
+            image,
+            (CV_DISPLAY_WIDTH, int(h * self._display_scale)),
+            interpolation=cv2.INTER_AREA,
+        )
 
     def _init_visualizers(self) -> None:
         if LOCAL_DEBUG:
-            self.visualizer = Pose3DVisualizer(self.pose_connections)
-            self.fk_visualizer = ReconstructedPoseVisualizer()
-            cv2.namedWindow(CV_WINDOW_NAME)
+            self.visualizer = CombinedPose3DVisualizer(
+                self.pose_connections,
+                raw_title="MediaPipe World",
+                fk_title="Joint Angles FK",
+                window_title="Motion Capture 3D (RealSense)",
+            )
+            cv2.namedWindow(CV_WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.setMouseCallback(CV_WINDOW_NAME, self._on_mouse)
-            print("[主进程] 3D 可视化窗口已创建（MediaPipe World + 关节角 FK 对比）")
+            print("[主进程] 3D 对比窗口已创建（左：MediaPipe | 右：FK 重建 | 轴测视角）")
+            print("[主进程] 3D 窗口：左键拖拽旋转 | 滚轮缩放 | 双击重置视角")
             print("[主进程] 点击 REC 按钮或按 R 键开始/停止录制")
 
     def _on_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+        if self._display_scale > 0:
+            x = int(x / self._display_scale)
+            y = int(y / self._display_scale)
         x1, y1, x2, y2 = self._record_btn_rect
         if x1 <= x <= x2 and y1 <= y <= y2:
             self.recorder.toggle()
@@ -856,17 +882,23 @@ class MotionCaptureApp:
         self.recorder.write(packet)
         self._draw_record_button(color_image)
 
-        cv2.imshow(CV_WINDOW_NAME, color_image)
+        cv2.imshow(CV_WINDOW_NAME, self._prepare_display(color_image))
 
-        if self.visualizer and keypoints:
-            self.visualizer.update(keypoints)
-
-        if self.fk_visualizer and joint_angles:
-            self.forward_kinematics.update_lengths(keypoints)
-            fk_nodes = self.forward_kinematics.rebuild(joint_angles)
-            self.fk_visualizer.update(fk_nodes)
-
-        pump_matplotlib_events()
+        if self.visualizer:
+            fk_nodes = None
+            if joint_angles and keypoints:
+                self.forward_kinematics.update_lengths(keypoints)
+                fk_nodes = self.forward_kinematics.rebuild(joint_angles)
+            valid_count = sum(
+                1 for kp in keypoints
+                if kp.get("confidence", 0) > 0
+                and (kp["x"] or kp["y"] or kp["z"])
+            ) if keypoints else 0
+            self.visualizer.update(
+                keypoints or None,
+                fk_nodes,
+                raw_title_suffix=f"({valid_count}/33)",
+            )
 
     def _drain_queue(self) -> tuple[Optional[dict], bool]:
         """排空队列，返回最新帧；若收到 error 则 should_stop=True。"""
@@ -904,7 +936,6 @@ class MotionCaptureApp:
                 if latest is not None:
                     self._handle_frame(latest)
 
-                pump_matplotlib_events()
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     print("[主进程] 用户请求退出")
@@ -931,8 +962,6 @@ class MotionCaptureApp:
 
         if self.visualizer:
             self.visualizer.close()
-        if self.fk_visualizer:
-            self.fk_visualizer.close()
         cv2.destroyAllWindows()
 
         elapsed = time.time() - self.start_time
